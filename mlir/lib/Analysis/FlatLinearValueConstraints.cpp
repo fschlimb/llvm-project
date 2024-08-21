@@ -893,7 +893,7 @@ FlatLinearValueConstraints::FlatLinearValueConstraints(IntegerSet set,
                             set.getNumDims(), set.getNumSymbols(),
                             /*numLocals=*/0) {
   assert(operands.empty() ||
-         set.getNumInputs() == operands.size() && "operand count mismatch");
+         (set.getNumInputs() == operands.size() && "operand count mismatch"));
   // Set the values for the non-local variables.
   for (unsigned i = 0, e = operands.size(); i < e; ++i)
     setValue(i, operands[i]);
