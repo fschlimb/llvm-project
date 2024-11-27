@@ -283,6 +283,7 @@ static FailureOr<ShardingOption> selectShardingOption(
 // have sharding annotations.
 static LogicalResult visitOp(Operation *op, OpBuilder &builder) {
   if (op->hasTrait<OpTrait::IsTerminator>() ||
+      op->hasTrait<OpTrait::ConstantLike>() ||
       llvm::isa<mesh::ShardOp, mesh::ShardingOp>(op))
     return success();
 

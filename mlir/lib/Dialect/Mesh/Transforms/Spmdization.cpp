@@ -697,10 +697,10 @@ static std::vector<MeshSharding> getResultShardings(Operation &op) {
   std::vector<MeshSharding> res;
   res.reserve(op.getNumResults());
   llvm::transform(op.getResults(), std::back_inserter(res),
-                  [](OpResult result) {
+                  [&op](OpResult result) {
                     TypedValue<RankedTensorType> rankedTensor =
                         dyn_cast<TypedValue<RankedTensorType>>(result);
-                    if (!rankedTensor) {
+                    if (!rankedTensor || op.hasTrait<OpTrait::ConstantLike>()) {
                       return MeshSharding();
                     }
 
