@@ -168,10 +168,10 @@ LogicalResult mesh::ShardingInterface::verifyShardingInterfaceImpl() {
 
   // check operands and results type
   for (Type type : op->getOperandTypes())
-    if (!llvm::isa<RankedTensorType>(type))
+    if (!llvm::isa<RankedTensorType>(type) && !type.isIntOrIndexOrFloat())
       return failure();
   for (Type type : op->getResultTypes())
-    if (!llvm::isa<RankedTensorType>(type))
+    if (!llvm::isa<RankedTensorType>(type) && !type.isIntOrIndexOrFloat())
       return failure();
 
   // check loop types
@@ -448,7 +448,12 @@ static FailureOr<MeshSharding> getSharding(OpOperand &opOperand,
                                            const ShardingOption &shardingOption,
                                            AffineMap map) {
   Value operandValue = opOperand.get();
-  auto operandType = cast<RankedTensorType>(operandValue.getType());
+  auto operandType = dyn_cast<RankedTensorType>(operandValue.getType());
+  if(!operandType) {
+    if(operandValue.getType().isIntOrIndexOrFloat())
+      return MeshSharding();
+    return failure();
+  }
   SmallVector<SmallVector<MeshAxis>> splitAxes(operandType.getRank());
   unsigned numDims = map.getNumDims();
   for (auto it : llvm::enumerate(map.getResults())) {
