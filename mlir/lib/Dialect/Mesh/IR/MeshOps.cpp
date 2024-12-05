@@ -796,6 +796,53 @@ void ShardOp::getAsmResultNames(
   setNameFn(getResult(), "sharding_annotated");
 }
 
+namespace {
+// Determine if the given ShardOp is a duplicate of another ShardOp
+// on the same value. This can happen if constant values are sharded.
+class FoldDuplicateShardOp final : public OpRewritePattern<ShardOp> {
+public:
+  using OpRewritePattern<ShardOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ShardOp op, PatternRewriter &b) const override {
+    // Get the use-list of the value being sharded and check if it has more than
+    // one use.
+    Value value = op.getSrc();
+    if (value.hasOneUse() || value.getDefiningOp<ShardOp>()) {
+      return failure();
+    }
+
+    // Iterate through the uses of the value to find a duplicate ShardOp.
+    for (auto &use : value.getUses()) {
+      if (use.getOwner() != op.getOperation()) {
+        auto otherOp = dyn_cast<ShardOp>(use.getOwner());
+        if (!otherOp || !otherOp->isBeforeInBlock(op)) {
+          return failure();
+        }
+        // Create a MeshSharding object for the current and the other ShardOp
+        // If the two are equal replace current op with the other op.
+        MeshSharding currentSharding(op.getSharding());
+        MeshSharding otherSharding(otherOp.getSharding());
+        if (currentSharding == otherSharding) {
+          b.replaceAllUsesWith(op.getResult(), otherOp.getResult());
+          b.eraseOp(op.getOperation());
+        } else {
+          // use the other sharding as input for op
+          op.getSrcMutable().assign(otherOp.getResult());
+        }
+        return success();
+      }
+    }
+
+    return failure();
+  }
+};
+} // namespace
+
+void ShardOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                          mlir::MLIRContext *context) {
+  results.add<FoldDuplicateShardOp>(context);
+}
+
 //===----------------------------------------------------------------------===//
 // mesh.process_multi_index op
 //===----------------------------------------------------------------------===//
