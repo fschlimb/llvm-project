@@ -236,6 +236,14 @@ struct ConvertUpdateHaloOp
     // local data. Because subviews and halos can have mixed dynamic and static
     // shapes, OpFoldResults are used whenever possible.
 
+    auto haloSizes =
+        getMixedValues(op.getStaticHaloSizes(), op.getHaloSizes(), rewriter);
+    if (haloSizes.empty()) {
+      // no halos -> nothing to do
+      rewriter.replaceOp(op, op.getDestination());
+      return mlir::success();
+    }
+
     SymbolTableCollection symbolTableCollection;
     auto loc = op.getLoc();
 
@@ -263,8 +271,6 @@ struct ConvertUpdateHaloOp
     auto opSplitAxes = op.getSplitAxes().getAxes();
     auto mesh = op.getMesh();
     auto meshOp = getMesh(op, symbolTableCollection);
-    auto haloSizes =
-        getMixedValues(op.getStaticHaloSizes(), op.getHaloSizes(), rewriter);
     // subviews need Index values
     for (auto &sz : haloSizes) {
       if (sz.is<Value>()) {
