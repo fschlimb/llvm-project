@@ -632,7 +632,7 @@ public:
           break;
         }
       }
-      if (!all_same) {
+      if (all_same) {
         offs.first.clear();
         modified = true;
       }
