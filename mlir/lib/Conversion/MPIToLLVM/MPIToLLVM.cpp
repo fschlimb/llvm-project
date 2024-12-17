@@ -280,20 +280,25 @@ struct SendOpLowering : ConvertOpToLLVMPattern<mpi::SendOp> {
     dataPtr =
         rewriter.create<LLVM::GEPOp>(loc, ptrType, elemType, dataPtr, offset)
             .getResult();
+    auto size =
+        rewriter
+            .create<LLVM::ExtractValueOp>(loc, memRef, ArrayRef<int64_t>{3, 0})
+            .getResult();
+    size = rewriter.create<LLVM::TruncOp>(loc, i32, size).getResult();
     auto dataType = MPIImplTraits::getDataType(loc, rewriter, elemType);
     auto commWorld = MPIImplTraits::getCommWorld(moduleOp, loc, rewriter);
 
     // LLVM Function type representing `i32 MPI_send(datatype, dst, tag, comm)`
     auto funcType = LLVM::LLVMFunctionType::get(
-        i32, {ptrType, i32, i32, i32, commWorld.getType()});
+        i32, {ptrType, i32, i32, i32, i32, commWorld.getType()});
     // get or create function declaration:
     LLVM::LLVMFuncOp funcDecl =
-        getOrDefineFunction(moduleOp, loc, rewriter, "MPI_send", funcType);
+        getOrDefineFunction(moduleOp, loc, rewriter, "MPI_Send", funcType);
 
     // replace op with function call
     auto funcCall = rewriter.create<LLVM::CallOp>(
         loc, funcDecl,
-        ValueRange{dataPtr, dataType, adaptor.getDest(), adaptor.getTag(),
+        ValueRange{dataPtr, size, dataType, adaptor.getDest(), adaptor.getTag(),
                    commWorld});
     if (op.getRetval()) {
       rewriter.replaceOp(op, funcCall.getResult());
@@ -338,6 +343,11 @@ struct RecvOpLowering : ConvertOpToLLVMPattern<mpi::RecvOp> {
     dataPtr =
         rewriter.create<LLVM::GEPOp>(loc, ptrType, elemType, dataPtr, offset)
             .getResult();
+    auto size =
+        rewriter
+            .create<LLVM::ExtractValueOp>(loc, memRef, ArrayRef<int64_t>{3, 0})
+            .getResult();
+    size = rewriter.create<LLVM::TruncOp>(loc, i32, size).getResult();
     auto dataType = MPIImplTraits::getDataType(loc, rewriter, elemType);
     auto commWorld = MPIImplTraits::getCommWorld(moduleOp, loc, rewriter);
     auto statusIgnore =
@@ -350,16 +360,16 @@ struct RecvOpLowering : ConvertOpToLLVMPattern<mpi::RecvOp> {
 
     // LLVM Function type representing `i32 MPI_Recv(datatype, dst, tag, comm)`
     auto funcType = LLVM::LLVMFunctionType::get(
-        i32, {ptrType, i32, i32, i32, commWorld.getType(), ptrType});
+        i32, {ptrType, i32, i32, i32, i32, commWorld.getType(), ptrType});
     // get or create function declaration:
     LLVM::LLVMFuncOp funcDecl =
-        getOrDefineFunction(moduleOp, loc, rewriter, "MPI_recv", funcType);
+        getOrDefineFunction(moduleOp, loc, rewriter, "MPI_Recv", funcType);
 
     // replace op with function call
     auto funcCall = rewriter.create<LLVM::CallOp>(
         loc, funcDecl,
-        ValueRange{dataPtr, dataType, adaptor.getSource(), adaptor.getTag(),
-                   commWorld, statusIgnore});
+        ValueRange{dataPtr, size, dataType, adaptor.getSource(),
+                   adaptor.getTag(), commWorld, statusIgnore});
     if (op.getRetval()) {
       rewriter.replaceOp(op, funcCall.getResult());
     } else {
