@@ -363,8 +363,8 @@ struct ConvertUpdateHaloOp
                                   : haloSizes[currHaloDim * 2];
         // Check if we need to send and/or receive
         // Processes on the mesh borders have only one neighbor
-        auto to = upperHalo ? neighbourIDs[1] : neighbourIDs[0];
-        auto from = upperHalo ? neighbourIDs[0] : neighbourIDs[1];
+        auto to = upperHalo ? neighbourIDs[0] : neighbourIDs[1];
+        auto from = upperHalo ? neighbourIDs[1] : neighbourIDs[0];
         auto hasFrom = rewriter.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::sge, from, zero);
         auto hasTo = rewriter.create<arith::CmpIOp>(
@@ -397,8 +397,23 @@ struct ConvertUpdateHaloOp
         offsets[dim] = orgOffset;
       };
 
-      genSendRecv(false);
-      genSendRecv(true);
+      auto get_i32val = [&](OpFoldResult &v) {
+        return v.is<Value>()
+                   ? v.get<Value>()
+                   : rewriter.create<::mlir::arith::ConstantOp>(
+                         loc, rewriter.getI32IntegerAttr(
+                                  cast<IntegerAttr>(v.get<Attribute>()).getInt()));
+      };
+
+      for (int i=0; i<2; ++i) {
+        Value haloSz = get_i32val(haloSizes[currHaloDim * 2 + i]);                              
+        auto hasSize = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, haloSz, zero);
+        rewriter.create<scf::IfOp>(
+            loc, hasSize, [&](OpBuilder &builder, Location loc) {
+              genSendRecv(i > 0);
+              builder.create<scf::YieldOp>(loc);
+            });
+      }
 
       // the shape for lower dims include higher dims' halos
       dimSizes[dim] = shape[dim];

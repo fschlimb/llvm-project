@@ -103,6 +103,30 @@ func.func @update_halo_1d_first(
 }
 
 // -----
+mesh.mesh @mesh0(shape = 4)
+memref.global "public" constant @static_mpi_rank : memref<index> = dense<1>
+// CHECK-LABEL: func @update_halo_1d_with_zero
+func.func @update_halo_1d_with_zero (
+  // CHECK-SAME: [[varg0:%.*]]: memref<120x120x120xi8>
+  %arg0 : memref<120x120x120xi8>) -> memref<120x120x120xi8> {
+  // CHECK: [[vc91_i32:%.*]] = arith.constant 91 : i32
+  // CHECK-NEXT: [[vc0_i32:%.*]] = arith.constant 0 : i32
+  // CHECK-NEXT: [[vc2_i32:%.*]] = arith.constant 2 : i32
+  // CHECK-NEXT: [[valloc:%.*]] = memref.alloc() : memref<2x120x120xi8>
+  // CHECK-NEXT: [[vsubview:%.*]] = memref.subview [[varg0]][118, 0, 0] [2, 120, 120] [1, 1, 1] : memref<120x120x120xi8> to memref<2x120x120xi8
+  // CHECK-NEXT: memref.copy [[vsubview]], [[valloc]] : memref<2x120x120xi8
+  // CHECK-SAME: to memref<2x120x120xi8>
+  // CHECK-NEXT: mpi.send([[valloc]], [[vc91_i32]], [[vc2_i32]]) : memref<2x120x120xi8>, i32, i32
+  // CHECK-NEXT: mpi.recv([[valloc]], [[vc91_i32]], [[vc0_i32]]) : memref<2x120x120xi8>, i32, i32
+  // CHECK-NEXT: [[vsubview_0:%.*]] = memref.subview [[varg0]][0, 0, 0] [2, 120, 120] [1, 1, 1] : memref<120x120x120xi8> to memref<2x120x120xi8
+  // CHECK-NEXT: memref.copy [[valloc]], [[vsubview_0]] : memref<2x120x120xi8> to memref<2x120x120xi8
+  // CHECK-NEXT: memref.dealloc [[valloc]] : memref<2x120x120xi8>
+  %res = mesh.update_halo %arg0 on @mesh0 split_axes = [[0]] halo_sizes = [2, 0] : memref<120x120x120xi8>
+  // CHECK: return [[res:%.*]] : memref<120x120x120xi8>
+  return %res : memref<120x120x120xi8>
+}
+
+// -----
 mesh.mesh @mesh0(shape = 3x4x5)
 memref.global constant @static_mpi_rank : memref<index> = dense<24>
 // CHECK-LABEL: func @update_halo_3d
