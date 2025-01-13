@@ -324,6 +324,63 @@ def Mesh_ShardingOp : Mesh_Op<"sharding", [
   let hasCanonicalizer = 1;
 }
 
+def Mesh_SplitAxesOp : Mesh_Op<"split_axes", [Pure]> {
+  let summary = "Get the split axes of the sharding of the given tensor.";
+  let description = [{
+    This operation returns the split axes of the sharding of the given tensor as a tensor.
+  }];
+  let arguments = (ins
+    AnyRankedTensor:$source
+  );
+  let results = (outs
+    TupleOf<[1DTensorOf<[I16]>]>:$result
+  );
+  let assemblyFormat = [{
+    $source attr-dict `:` type($source) `->` type($result)
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$source)>
+  ];
+}
+
+def Mesh_HaloSizesOp : Mesh_Op<"halo_sizes", [Pure]> {
+  let summary = "Get the halo sizes of the sharding of the given tensor.";
+  let description = [{
+    This operation returns the halo sizes of the sharding of the given tensor as a tensor.
+  }];
+  let arguments = (ins
+    AnyRankedTensor:$source
+  );
+  let results = (outs
+    2DTensorOf<[I64]>:$result
+  );
+  let assemblyFormat = [{
+    $source attr-dict `:` type($source) `->` type($result)
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$source)>
+  ];
+}
+
+def Mesh_ShardedDimsOffsetsOp : Mesh_Op<"sharded_dims_offsets", [Pure]> {
+  let summary = "Get the offsets of sharded dimensions of the sharding of the given tensor.";
+  let description = [{
+    This operation returns the offsets of sharded dimensions of the sharding of the given tensor as a tensor.
+  }];
+  let arguments = (ins
+    AnyRankedTensor:$source
+  );
+  let results = (outs
+    TupleOf<[1DTensorOf<[I64]>]>:$result
+  );
+  let assemblyFormat = [{
+    $source attr-dict `:` type($source) `->` type($result)
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$source)>
+  ];
+}
+
 def Mesh_ShardShapeOp : Mesh_Op<"shard_shape", [Pure]> {
   let summary = "Get the shard shape of a given process/device.";
   let description = [{

@@ -164,6 +164,42 @@ func.func @mesh_shard_shape() {
   return
 }
 
+// CHECK-LABEL: func @mesh_get_split_axes
+// CHECK-SAME: %[[ARG:.*]]: tensor<4x8xf32>
+func.func @mesh_get_split_axes(%arg0 : tensor<4x8xf32>) -> tuple<tensor<?xi16>, tensor<?xi16>> {
+  // CHECK-NEXT: %[[S:.*]] = mesh.sharding @mesh1 split_axes = {{\[\[}}], [0]] : !mesh.sharding
+  %s = mesh.sharding @mesh1 split_axes = [[], [0]] : !mesh.sharding
+  // CHECK-NEXT: %[[ST:.*]] = mesh.shard %[[ARG]] to %[[S]] : tensor<4x8xf32>
+  %st = mesh.shard %arg0 to %s : tensor<4x8xf32>
+  // CHECK-NEXT: mesh.split_axes %[[ST]] : tensor<4x8xf32> -> tuple<tensor<?xi16>, tensor<?xi16>>
+  %0 = mesh.split_axes %st : tensor<4x8xf32> -> tuple<tensor<?xi16>, tensor<?xi16>>
+  return %0 : tuple<tensor<?xi16>, tensor<?xi16>>
+}
+
+// CHECK-LABEL: func @mesh_get_halo_sizes
+// CHECK-SAME: %[[ARG:.*]]: tensor<4x8xf32>
+func.func @mesh_get_halo_sizes(%arg0 : tensor<4x8xf32>) -> tensor<2x2xi64> {
+  // CHECK: %[[S:.*]] = mesh.sharding @mesh4 split_axes = {{\[\[}}0], [1]] halo_sizes = [1, 2, 3, 4] : !mesh.sharding
+  %s = mesh.sharding @mesh4 split_axes = [[0], [1]] halo_sizes = [1, 2, 3, 4] : !mesh.sharding
+  // CHECK-NEXT: %[[ST:.*]] = mesh.shard %[[ARG]] to %[[S]] : tensor<4x8xf32>
+  %st = mesh.shard %arg0 to %s : tensor<4x8xf32>
+  // CHECK-NEXT: mesh.halo_sizes %[[ST]] : tensor<4x8xf32> -> tensor<2x2xi64>
+  %0 = mesh.halo_sizes %st : tensor<4x8xf32> -> tensor<2x2xi64>
+  return %0 : tensor<2x2xi64>
+}
+
+// CHECK-LABEL: func @mesh_get_sharded_dims_offs
+// CHECK-SAME: %[[ARG:.*]]: tensor<4x8xf32>
+func.func @mesh_get_sharded_dims_offs(%arg0 : tensor<4x8xf32>) -> tuple<tensor<?xi64>, tensor<?xi64>> {
+  // CHECK-NEXT: %[[S:.*]] = mesh.sharding @mesh1 split_axes = {{\[\[}}], [0]] : !mesh.sharding
+  %s = mesh.sharding @mesh1 split_axes = [[], [0]] : !mesh.sharding
+  // CHECK-NEXT: %[[ST:.*]] = mesh.shard %[[ARG]] to %[[S]] : tensor<4x8xf32>
+  %st = mesh.shard %arg0 to %s : tensor<4x8xf32>
+  // CHECK-NEXT: mesh.sharded_dims_offsets %[[ST]] : tensor<4x8xf32> -> tuple<tensor<?xi64>, tensor<?xi64>>
+  %0 = mesh.sharded_dims_offsets %st : tensor<4x8xf32> -> tuple<tensor<?xi64>, tensor<?xi64>>
+  return %0 : tuple<tensor<?xi64>, tensor<?xi64>>
+}
+
 // CHECK-LABEL: func @mesh_shape
 func.func @mesh_shape() -> (index, index) {
   // CHECK: %[[RES:.*]]:2 = mesh.mesh_shape @mesh0 axes = [0, 1] : index, index
