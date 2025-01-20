@@ -809,67 +809,6 @@ MeshSharding MeshSharding::get(::mlir::FlatSymbolRefAttr mesh_,
 }
 
 //===----------------------------------------------------------------------===//
-// mesh.split_axes
-//===----------------------------------------------------------------------===//
-
-void SplitAxesOp::build(::mlir::OpBuilder &b, ::mlir::OperationState &odsState,
-                        ::mlir::Value source) {
-  auto shardOp = source.getDefiningOp<ShardOp>();
-  assert(shardOp && "expected shard op");
-  auto shardingOp = shardOp.getSharding().getDefiningOp<ShardingOp>();
-  assert(shardingOp && "expected sharding op");
-  SmallVector<Type> resTypes;
-  for (auto axes : shardingOp.getSplitAxes().getAxes()) {
-    resTypes.emplace_back(RankedTensorType::get({axes.size()}, b.getI16Type()));
-  }
-  build(b, odsState, TupleType::get(b.getContext(), resTypes), shardingOp);
-}
-
-//===----------------------------------------------------------------------===//
-// mesh.halo_sizes
-//===----------------------------------------------------------------------===//
-
-void HaloSizesOp::build(::mlir::OpBuilder &b, ::mlir::OperationState &odsState,
-                        ::mlir::Value source) {
-  auto shardOp = source.getDefiningOp<ShardOp>();
-  assert(shardOp && "expected shard op");
-  auto shardingOp = shardOp.getSharding().getDefiningOp<ShardingOp>();
-  assert(shardingOp && "expected sharding op");
-  auto splitAxes = shardingOp.getSplitAxes().getAxes();
-  int64_t nSplitAxes = splitAxes.size();
-  for (auto axes : splitAxes) {
-    if (axes.empty()) {
-      --nSplitAxes;
-    }
-  }
-  auto tType = RankedTensorType::get({nSplitAxes, 2}, b.getI64Type());
-  build(b, odsState, tType, shardingOp);
-}
-
-//===----------------------------------------------------------------------===//
-// mesh.sharded_dims_offsets
-//===----------------------------------------------------------------------===//
-
-void ShardedDimsOffsetsOp::build(::mlir::OpBuilder &b,
-                                 ::mlir::OperationState &odsState,
-                                 ::mlir::Value source) {
-  auto shardOp = source.getDefiningOp<ShardOp>();
-  assert(shardOp && "expected shard op");
-  auto shardingOp = shardOp.getSharding().getDefiningOp<ShardingOp>();
-  assert(shardingOp && "expected sharding op");
-  SymbolTableCollection symbolTableCollection;
-  auto mesh = getMesh(shardingOp, symbolTableCollection);
-  SmallVector<Type> resTypes;
-  for (auto axes : shardingOp.getSplitAxes().getAxes()) {
-    // +1 for the total size of the sharded dimension
-    auto nOffs =
-        1 + collectiveProcessGroupSize(axes.asArrayRef(), mesh.getShape());
-    resTypes.emplace_back(RankedTensorType::get({nOffs}, b.getI64Type()));
-  }
-  build(b, odsState, TupleType::get(b.getContext(), resTypes), shardingOp);
-}
-
-//===----------------------------------------------------------------------===//
 // mesh.shard_shape
 //===----------------------------------------------------------------------===//
 
