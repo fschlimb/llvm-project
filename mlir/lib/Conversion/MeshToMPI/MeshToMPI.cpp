@@ -14,8 +14,12 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MPI/IR/MPI.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Mesh/IR/MeshDialect.h"
 #include "mlir/Dialect/Mesh/IR/MeshOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -25,6 +29,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "mesh-to-mpi"
@@ -72,13 +77,181 @@ Value multiToLinearIndex(Location loc, OpBuilder b, ValueRange multiIndex,
   return linearIndex;
 }
 
-struct ConvertProcessMultiIndexOp
-    : public mlir::OpRewritePattern<mlir::mesh::ProcessMultiIndexOp> {
-  using OpRewritePattern::OpRewritePattern;
+// replace GetShardingOp with related ShardingOp
+struct ConvertGetShardingOp
+    : public mlir::OpConversionPattern<mlir::mesh::GetShardingOp> {
+  using OpConversionPattern::OpConversionPattern;
 
   mlir::LogicalResult
-  matchAndRewrite(mlir::mesh::ProcessMultiIndexOp op,
-                  mlir::PatternRewriter &rewriter) const override {
+  matchAndRewrite(mlir::mesh::GetShardingOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto shardOp = adaptor.getSource().getDefiningOp<ShardOp>();
+    if (!shardOp) {
+      return mlir::failure();
+    }
+    auto shardingOp = shardOp.getSharding().getDefiningOp<ShardingOp>();
+    if (!shardingOp) {
+      return mlir::failure();
+    }
+
+    rewriter.replaceOp(op, shardingOp.getResult());
+    return mlir::success();
+  }
+};
+
+struct ConvertShardingOp
+    : public mlir::OpConversionPattern<mlir::mesh::ShardingOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::mesh::ShardingOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto splitAxes = op.getSplitAxes().getAxes();
+    int64_t maxNAxes = 0;
+    for (auto axes : splitAxes) {
+      maxNAxes = std::max<int64_t>(maxNAxes, axes.size());
+    }
+
+    // To hold the split axes, create empty 2d tensor with shape
+    // {splitAxes.size(), max-size-of-split-groups}.
+    // Set trailing elements for smaller split-groups to -1.
+    auto loc = op.getLoc();
+    auto i16 = rewriter.getI16Type();
+    auto i64 = rewriter.getI64Type();
+    int64_t shape[] = {static_cast<int64_t>(splitAxes.size()), maxNAxes};
+    Value resSplitAxes = rewriter.create<tensor::EmptyOp>(loc, shape, i16);
+    auto attr = IntegerAttr::get(i16, 0xffff);
+    auto fillValue = rewriter.create<arith::ConstantOp>(loc, i16, attr);
+    resSplitAxes =
+        rewriter
+            .create<linalg::FillOp>(loc, fillValue.getResult(), resSplitAxes)
+            .getResult(0);
+
+    // explicitly write values into tensor row by row
+    int64_t strides[] = {1, 1};
+    int64_t nSplits = 0;
+    ValueRange empty = {};
+    for (auto [i, axes] : llvm::enumerate(splitAxes)) {
+      int64_t size = axes.size();
+      if (size > 0) {
+        ++nSplits;
+      }
+      int64_t offs[] = {(int64_t)i, 0};
+      int64_t sizes[] = {1, size};
+      auto tensorType = RankedTensorType::get({size}, i16);
+      auto attrs = DenseIntElementsAttr::get(tensorType, axes.asArrayRef());
+      auto vals = rewriter.create<arith::ConstantOp>(loc, tensorType, attrs);
+      resSplitAxes = rewriter.create<tensor::InsertSliceOp>(
+          loc, vals, resSplitAxes, empty, empty, empty, offs, sizes, strides);
+    }
+
+    // convert vec of OpFoldResults (ints) into vec of Values
+    auto getMixedAsValues = [&](llvm::ArrayRef<int64_t> statics,
+                                ValueRange dynamics) {
+      SmallVector<Value> values;
+      auto dyn = dynamics.begin();
+      for (auto s : statics) {
+        values.emplace_back(
+            ShapedType::isDynamic(s)
+                ? *(dyn++)
+                : rewriter
+                      .create<arith::ConstantOp>(loc, i64,
+                                                 rewriter.getI64IntegerAttr(s))
+                      .getResult());
+      }
+      return values;
+    };
+
+    // To hold halos sizes, create 2d Tensor with shape {nSplits, 2}.
+    // Store the halo sizes in the tensor.
+    auto haloSizes = getMixedAsValues(adaptor.getStaticHaloSizes(),
+                                      adaptor.getDynamicHaloSizes());
+    auto type = RankedTensorType::get({nSplits, 2}, i64);
+    Value resHaloSizes =
+        haloSizes.empty()
+            ? rewriter
+                  .create<tensor::EmptyOp>(loc, std::array<int64_t, 2>{0, 0},
+                                           i64)
+                  .getResult()
+            : rewriter.create<tensor::FromElementsOp>(loc, type, haloSizes)
+                  .getResult();
+
+    // To hold sharded dims offsets, create Tensor with shape {nSplits,
+    // maxSplitSize+1}. Store the offsets in the tensor but set trailing
+    // elements for smaller split-groups to -1. Computing the max size of the
+    // split groups needs using collectiveProcessGroupSize (which needs the
+    // MeshOp)
+    Value resOffsets;
+    if (adaptor.getStaticShardedDimsOffsets().empty()) {
+      resOffsets = rewriter.create<tensor::EmptyOp>(
+          loc, std::array<int64_t, 2>{0, 0}, i64);
+    } else {
+      SymbolTableCollection symbolTableCollection;
+      auto meshOp = getMesh(op, symbolTableCollection);
+      auto maxSplitSize = 0;
+      for (auto axes : splitAxes) {
+        auto splitSize =
+            collectiveProcessGroupSize(axes.asArrayRef(), meshOp.getShape());
+        assert(splitSize != ShapedType::kDynamic);
+        maxSplitSize = std::max<int64_t>(maxSplitSize, splitSize);
+      }
+      assert(maxSplitSize);
+      ++maxSplitSize; // add one for the total size
+
+      resOffsets = rewriter.create<tensor::EmptyOp>(
+          loc, std::array<int64_t, 2>{nSplits, maxSplitSize}, i64);
+      auto zero =
+          rewriter
+              .create<arith::ConstantOp>(
+                  loc, i64, rewriter.getI64IntegerAttr(ShapedType::kDynamic))
+              .getResult();
+      resOffsets =
+          rewriter.create<linalg::FillOp>(loc, zero, resOffsets).getResult(0);
+      auto offsets = getMixedAsValues(adaptor.getStaticShardedDimsOffsets(),
+                                      adaptor.getDynamicShardedDimsOffsets());
+      int64_t curr = 0;
+      for (auto [i, axes] : llvm::enumerate(splitAxes)) {
+        auto splitSize =
+            collectiveProcessGroupSize(axes.asArrayRef(), meshOp.getShape());
+        assert(splitSize != ShapedType::kDynamic && splitSize < maxSplitSize);
+        ++splitSize; // add one for the total size
+        ArrayRef<Value> values(&offsets[curr], splitSize);
+        auto vals = rewriter.create<tensor::FromElementsOp>(loc, values);
+        int64_t offs[] = {(int64_t)i, 0};
+        int64_t sizes[] = {1, splitSize};
+        resOffsets = rewriter.create<tensor::InsertSliceOp>(
+            loc, vals, resOffsets, empty, empty, empty, offs, sizes, strides);
+        curr += splitSize;
+      }
+    }
+
+    // return a tuple of tensors as defined by type converter
+    SmallVector<Type> resTypes;
+    if (failed(getTypeConverter()->convertType(op.getResult().getType(),
+                                               resTypes))) {
+      return mlir::failure();
+    }
+    resSplitAxes =
+        rewriter.create<tensor::CastOp>(loc, resTypes[0], resSplitAxes);
+    resHaloSizes =
+        rewriter.create<tensor::CastOp>(loc, resTypes[1], resHaloSizes);
+    resOffsets = rewriter.create<tensor::CastOp>(loc, resTypes[2], resOffsets);
+
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
+        op, TupleType::get(op.getContext(), resTypes),
+        ValueRange{resSplitAxes, resHaloSizes, resOffsets});
+
+    return mlir::success();
+  }
+};
+
+struct ConvertProcessMultiIndexOp
+    : public mlir::OpConversionPattern<mlir::mesh::ProcessMultiIndexOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::mesh::ProcessMultiIndexOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
 
     // Currently converts its linear index to a multi-dimensional index.
 
@@ -100,7 +273,7 @@ struct ConvertProcessMultiIndexOp
     auto mIdx = linearToMultiIndex(loc, rewriter, rank, dims);
 
     // optionally extract subset of mesh axes
-    auto axes = op.getAxes();
+    auto axes = adaptor.getAxes();
     if (!axes.empty()) {
       SmallVector<Value> subIndex;
       for (auto axis : axes) {
@@ -115,12 +288,12 @@ struct ConvertProcessMultiIndexOp
 };
 
 struct ConvertProcessLinearIndexOp
-    : public mlir::OpRewritePattern<mlir::mesh::ProcessLinearIndexOp> {
-  using OpRewritePattern::OpRewritePattern;
+    : public mlir::OpConversionPattern<mlir::mesh::ProcessLinearIndexOp> {
+  using OpConversionPattern::OpConversionPattern;
 
   mlir::LogicalResult
-  matchAndRewrite(mlir::mesh::ProcessLinearIndexOp op,
-                  mlir::PatternRewriter &rewriter) const override {
+  matchAndRewrite(mlir::mesh::ProcessLinearIndexOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
 
     // Finds a global named "static_mpi_rank" it will use that splat value.
     // Otherwise it defaults to mpi.comm_rank.
@@ -149,18 +322,18 @@ struct ConvertProcessLinearIndexOp
 };
 
 struct ConvertNeighborsLinearIndicesOp
-    : public mlir::OpRewritePattern<mlir::mesh::NeighborsLinearIndicesOp> {
-  using OpRewritePattern::OpRewritePattern;
+    : public mlir::OpConversionPattern<mlir::mesh::NeighborsLinearIndicesOp> {
+  using OpConversionPattern::OpConversionPattern;
 
   mlir::LogicalResult
-  matchAndRewrite(mlir::mesh::NeighborsLinearIndicesOp op,
-                  mlir::PatternRewriter &rewriter) const override {
+  matchAndRewrite(mlir::mesh::NeighborsLinearIndicesOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
 
     // Computes the neighbors indices along a split axis by simply
     // adding/subtracting 1 to the current index in that dimension.
     // Assigns -1 if neighbor is out of bounds.
 
-    auto axes = op.getSplitAxes();
+    auto axes = adaptor.getSplitAxes();
     // For now only single axis sharding is supported
     if (axes.size() != 1) {
       return mlir::failure();
@@ -169,7 +342,7 @@ struct ConvertNeighborsLinearIndicesOp
     auto loc = op.getLoc();
     SymbolTableCollection symbolTableCollection;
     auto meshOp = getMesh(op, symbolTableCollection);
-    auto mIdx = op.getDevice();
+    auto mIdx = adaptor.getDevice();
     auto orgIdx = mIdx[axes[0]];
     SmallVector<Value> dims;
     llvm::transform(
@@ -217,12 +390,12 @@ struct ConvertNeighborsLinearIndicesOp
 };
 
 struct ConvertUpdateHaloOp
-    : public mlir::OpRewritePattern<mlir::mesh::UpdateHaloOp> {
-  using OpRewritePattern::OpRewritePattern;
+    : public mlir::OpConversionPattern<mlir::mesh::UpdateHaloOp> {
+  using OpConversionPattern::OpConversionPattern;
 
   mlir::LogicalResult
-  matchAndRewrite(mlir::mesh::UpdateHaloOp op,
-                  mlir::PatternRewriter &rewriter) const override {
+  matchAndRewrite(mlir::mesh::UpdateHaloOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
 
     // The input/output memref is assumed to be in C memory order.
     // Halos are exchanged as 2 blocks per dimension (one for each side: down
@@ -236,11 +409,11 @@ struct ConvertUpdateHaloOp
     // local data. Because subviews and halos can have mixed dynamic and static
     // shapes, OpFoldResults are used whenever possible.
 
-    auto haloSizes =
-        getMixedValues(op.getStaticHaloSizes(), op.getHaloSizes(), rewriter);
+    auto haloSizes = getMixedValues(adaptor.getStaticHaloSizes(),
+                                    adaptor.getHaloSizes(), rewriter);
     if (haloSizes.empty()) {
       // no halos -> nothing to do
-      rewriter.replaceOp(op, op.getDestination());
+      rewriter.replaceOp(op, adaptor.getDestination());
       return mlir::success();
     }
 
@@ -257,7 +430,7 @@ struct ConvertUpdateHaloOp
                            cast<IntegerAttr>(v.get<Attribute>()).getInt()));
     };
 
-    auto dest = op.getDestination();
+    auto dest = adaptor.getDestination();
     auto dstShape = cast<ShapedType>(dest.getType()).getShape();
     Value array = dest;
     if (isa<RankedTensorType>(array.getType())) {
@@ -268,8 +441,8 @@ struct ConvertUpdateHaloOp
                   .getResult();
     }
     auto rank = cast<ShapedType>(array.getType()).getRank();
-    auto opSplitAxes = op.getSplitAxes().getAxes();
-    auto mesh = op.getMesh();
+    auto opSplitAxes = adaptor.getSplitAxes().getAxes();
+    auto mesh = adaptor.getMesh();
     auto meshOp = getMesh(op, symbolTableCollection);
     // subviews need Index values
     for (auto &sz : haloSizes) {
@@ -441,14 +614,69 @@ struct ConvertMeshToMPIPass
 
   /// Run the dialect converter on the module.
   void runOnOperation() override {
-    auto *ctx = &getContext();
-    mlir::RewritePatternSet patterns(ctx);
+    auto *ctxt = &getContext();
+    mlir::RewritePatternSet patterns(ctxt);
+    ConversionTarget target(getContext());
+    mlir::TypeConverter typeConverter;
 
-    patterns.insert<ConvertUpdateHaloOp, ConvertNeighborsLinearIndicesOp,
-                    ConvertProcessLinearIndexOp, ConvertProcessMultiIndexOp>(
-        ctx);
+    typeConverter.addConversion([](Type type) { return type; });
+    // convert mesh::ShardingType to a tuple of RankedTensorTypes
+    typeConverter.addConversion(
+        [](ShardingType type,
+           SmallVectorImpl<Type> &results) -> std::optional<LogicalResult> {
+          auto i16 = IntegerType::get(type.getContext(), 16);
+          auto i64 = IntegerType::get(type.getContext(), 64);
+          std::array<int64_t, 2> shp{ShapedType::kDynamic,
+                                     ShapedType::kDynamic};
+          results.emplace_back(RankedTensorType::get(shp, i16));
+          results.emplace_back(RankedTensorType::get(shp, i64)); // actually ?x2
+          results.emplace_back(RankedTensorType::get(shp, i64));
+          return mlir::success();
+        });
+    // To extract components a UnrealizedConversionCastOp is expected to define
+    // the input
+    typeConverter.addTargetMaterialization(
+        [&](OpBuilder &builder, TypeRange resultTypes, ValueRange inputs,
+            Location loc) {
+          if (inputs.size() != 1 || !isa<TupleType>(inputs[0].getType())) {
+            return SmallVector<Value>();
+          }
+          auto castOp = inputs[0].getDefiningOp<UnrealizedConversionCastOp>();
+          if (!castOp) {
+            return SmallVector<Value>();
+          }
+          SmallVector<Value> results;
+          for (auto oprnd : castOp.getInputs()) {
+            if (!isa<RankedTensorType>(oprnd.getType())) {
+              return SmallVector<Value>();
+            }
+            results.emplace_back(oprnd);
+          }
+          return results;
+        });
 
-    (void)mlir::applyPatternsGreedily(getOperation(), std::move(patterns));
+    target.addIllegalDialect<mesh::MeshDialect>();
+    target.addLegalOp<mesh::MeshOp>();
+    target.addLegalDialect<BuiltinDialect, mpi::MPIDialect, scf::SCFDialect,
+                           arith::ArithDialect, tensor::TensorDialect,
+                           bufferization::BufferizationDialect,
+                           linalg::LinalgDialect, memref::MemRefDialect>();
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      return typeConverter.isSignatureLegal(op.getFunctionType());
+    });
+    target.addDynamicallyLegalOp<func::CallOp, func::ReturnOp>(
+        [&](Operation *op) { return typeConverter.isLegal(op); });
+
+    patterns.add<ConvertUpdateHaloOp, ConvertNeighborsLinearIndicesOp,
+                 ConvertProcessLinearIndexOp, ConvertProcessMultiIndexOp,
+                 ConvertShardingOp, ConvertGetShardingOp>(typeConverter, ctxt);
+    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
+        patterns, typeConverter);
+    populateCallOpTypeConversionPattern(patterns, typeConverter);
+    populateReturnOpTypeConversionPattern(patterns, typeConverter);
+
+    (void)mlir::applyPartialConversion(getOperation(), target,
+                                       std::move(patterns));
   }
 };
 
