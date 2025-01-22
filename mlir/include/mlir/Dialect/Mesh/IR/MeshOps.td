@@ -318,6 +318,11 @@ def Mesh_ShardingOp : Mesh_Op<"sharding", [
                    "ArrayRef<MeshAxesAttr>":$split_axes,
                    "::mlir::ArrayRef<::mlir::OpFoldResult>":$halo_sizes,
                    "::mlir::ArrayRef<::mlir::OpFoldResult>":$sharded_dims_offsets)>,
+    OpBuilder<(ins "llvm::StringRef":$mesh,
+                   "ArrayRef<MeshAxesAttr>":$split_axes,
+                   CArg<"ArrayRef<int64_t>", "{}">:$static_halo_sizes,
+                   CArg<"ArrayRef<int64_t>", "{}">:$static_sharded_dims_offsets
+    )>,
     OpBuilder<(ins "mlir::mesh::MeshSharding":$from)>
   ];
   let hasVerifier = 1;
