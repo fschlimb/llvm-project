@@ -81,9 +81,8 @@ func.func @move_split_axis_dynamic_mesh(
   %arg0: tensor<10x14xf32>
 ) -> tensor<10x14xf32> {
   // CHECK: %[[SOURCE_SHARD:.*]] = builtin.unrealized_conversion_cast %[[ARG]] : tensor<10x14xf32> to tensor<?x14xf32>
-  // CHECK: %[[ALL_TO_ALL:.*]] = mesh.all_to_all %[[SOURCE_SHARD]] on @mesh_1d_dynamic mesh_axes = [0] split_axis = 1 concat_axis = 0 : tensor<?x14xf32> -> tensor<?x?xf32>
-  // CHECK: %[[TARGET_SHARD:.*]] = tensor.cast %[[ALL_TO_ALL]] : tensor<?x?xf32> to tensor<10x?xf32>
-  // CHECK: %[[RES:.*]] = builtin.unrealized_conversion_cast %[[TARGET_SHARD]] : tensor<10x?xf32> to tensor<10x14xf32>
+  // CHECK: %[[ALL_TO_ALL:.*]] = mesh.all_to_all %[[SOURCE_SHARD]] on @mesh_1d_dynamic mesh_axes = [0] split_axis = 1 concat_axis = 0 : tensor<?x14xf32> -> tensor<10x?xf32>
+  // CHECK: %[[RES:.*]] = builtin.unrealized_conversion_cast %[[ALL_TO_ALL]] : tensor<10x?xf32> to tensor<10x14xf32>
   %s0 = mesh.sharding @mesh_1d_dynamic split_axes = [[0]] : !mesh.sharding
   %0 = mesh.shard %arg0 to %s0 : tensor<10x14xf32>
   %s1 = mesh.sharding @mesh_1d_dynamic split_axes = [[], [0]] : !mesh.sharding
@@ -157,13 +156,12 @@ func.func @unshard_static_axis_on_dynamic_mesh_axis(
   %arg0: tensor<10x14xf32>
 ) -> tensor<10x14xf32> {
   // CHECK: %[[SOURCE_SHARD:.*]] = builtin.unrealized_conversion_cast %[[ARG]] : tensor<10x14xf32> to tensor<?x14xf32>
-  // CHECK: %[[ALL_GATHER:.*]] = mesh.all_gather %[[SOURCE_SHARD]] on @mesh_1d_dynamic mesh_axes = [0] gather_axis = 0 : tensor<?x14xf32> -> tensor<?x14xf32>
-  // CHECK: %[[RES:.*]] = tensor.cast %[[ALL_GATHER]] : tensor<?x14xf32> to tensor<10x14xf32>
+  // CHECK: %[[ALL_GATHER:.*]] = mesh.all_gather %[[SOURCE_SHARD]] on @mesh_1d_dynamic mesh_axes = [0] gather_axis = 0 : tensor<?x14xf32> -> tensor<10x14xf32>
   %s0 = mesh.sharding @mesh_1d_dynamic split_axes = [[0]] : !mesh.sharding
   %0 = mesh.shard %arg0 to %s0 : tensor<10x14xf32>
   %s1 = mesh.sharding @mesh_1d_dynamic split_axes = [[]] : !mesh.sharding
   %1 = mesh.shard %0 to %s1 annotate_for_users : tensor<10x14xf32>
-  // CHECK: return %[[RES]] : tensor<10x14xf32>
+  // CHECK: return %[[ALL_GATHER]] : tensor<10x14xf32>
   return %1 : tensor<10x14xf32>
 }
 

@@ -45,29 +45,6 @@ using namespace mlir;
 using namespace mesh;
 
 namespace {
-/// Converts a vector of OpFoldResults (ints) into vector of Values of the
-/// provided type.
-static SmallVector<Value> getMixedAsValues(OpBuilder b, const Location &loc,
-                                           llvm::ArrayRef<int64_t> statics,
-                                           ValueRange dynamics,
-                                           Type type = Type()) {
-  SmallVector<Value> values;
-  auto dyn = dynamics.begin();
-  Type i64 = b.getI64Type();
-  if (!type)
-    type = i64;
-  assert((i64 == type || b.getIndexType() == type) &&
-         "expected an i64 or an intex type");
-  for (auto s : statics) {
-    if (s == ShapedType::kDynamic) {
-      values.emplace_back(*(dyn++));
-    } else {
-      TypedAttr val = type == i64 ? b.getI64IntegerAttr(s) : b.getIndexAttr(s);
-      values.emplace_back(b.create<arith::ConstantOp>(loc, type, val));
-    }
-  }
-  return values;
-}
 
 /// Create operations converting a linear index to a multi-dimensional index.
 static SmallVector<Value> linearToMultiIndex(Location loc, OpBuilder b,

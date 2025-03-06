@@ -336,18 +336,6 @@ func.func @all_gather_invalid_gather_axis_dimension_size(
 
 mesh.mesh @mesh0(shape = 1)
 
-func.func @all_gather_invalid_gather_axis_dynamic_dimension(
-    %arg0 : tensor<?xf32>) -> tensor<3xf32> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 3.}}
-  %0 = mesh.all_gather %arg0 on @mesh0 gather_axis = 0
-    : tensor<?xf32> -> tensor<3xf32>
-  return %0 : tensor<3xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 1)
-
 func.func @all_gather_invalid_gather_axis(
     %arg0 : tensor<3xf32>) -> tensor<3xf32> {
   // expected-error@+1 {{Gather axis 1 is out of bounds [0, 1).}}
@@ -385,19 +373,6 @@ func.func @all_slice_duplicate_mesh_axis(
 
 mesh.mesh @mesh0(shape = 3)
 
-func.func @all_slice_invalid_dynamic_dimension(
-    %arg0 : tensor<?xf32>) -> tensor<2xf32> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 2.}}
-  %0 = mesh.all_slice %arg0 on @mesh0
-    slice_axis = 0
-    : tensor<?xf32> -> tensor<2xf32>
-  return %0 : tensor<2xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
 func.func @all_slice_invalid_static_dimension_size(
     %arg0 : tensor<3xf32>) -> tensor<2xf32> {
   // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected 1, but got 2.}}
@@ -405,19 +380,6 @@ func.func @all_slice_invalid_static_dimension_size(
     slice_axis = 0
     : tensor<3xf32> -> tensor<2xf32>
   return %0 : tensor<2xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
-func.func @all_slice_invalid_operand_static_dimension_size(
-    %arg0 : tensor<4xf32>) -> tensor<?xf32> {
-  // expected-error@+1 {{Operand dimension size 4 is not divisible by collective device group size 3 for tensor axis 0.}}
-  %0 = mesh.all_slice %arg0 on @mesh0 mesh_axes = [0]
-    slice_axis = 0
-    : tensor<4xf32> -> tensor<?xf32>
-  return %0 : tensor<?xf32>
 }
 
 // -----
@@ -442,45 +404,6 @@ func.func @all_to_all_duplicate_mesh_axis(
     split_axis = 0 concat_axis = 0
     : tensor<3x6xi8> -> tensor<3x6xi8>
   return %0 : tensor<3x6xi8>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = ?x1)
-
-func.func @all_to_all_invalid_non_dynamic_result_dimension_induced_by_dynamic_device_group(
-    %arg0 : tensor<3x6xi8>) -> tensor<3x6xi8> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 1. Expected dynamic, but got 6.}}
-  %0 = mesh.all_to_all %arg0 on @mesh0 mesh_axes = [0]
-    split_axis = 0 concat_axis = 1
-    : tensor<3x6xi8> -> tensor<3x6xi8>
-  return %0 : tensor<3x6xi8>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 1x1)
-
-func.func @all_to_all_invalid_non_dynamic_result_split_dimension_induced_by_dynamic_operand_dimension(
-    %arg0 : tensor<?x6xi8>) -> tensor<3x?xi8> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 3.}}
-  %0 = mesh.all_to_all %arg0 on @mesh0 mesh_axes = [1]
-    split_axis = 0 concat_axis = 1
-    : tensor<?x6xi8> -> tensor<3x?xi8>
-  return %0 : tensor<3x?xi8>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 1x1)
-
-func.func @all_to_all_invalid_non_dynamic_result_concat_dimension_induced_by_dynamic_operand_dimension(
-    %arg0 : tensor<3x?xi8>) -> tensor<?x3xi8> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 1. Expected dynamic, but got 3.}}
-  %0 = mesh.all_to_all %arg0 on @mesh0 mesh_axes = [1]
-    split_axis = 0 concat_axis = 1
-    : tensor<3x?xi8> -> tensor<?x3xi8>
-  return %0 : tensor<?x3xi8>
 }
 
 // -----
@@ -582,18 +505,6 @@ func.func @gather_invalid_gather_axis_dimension_size(
   %0 = mesh.gather %arg0 on @mesh0 mesh_axes = [1] gather_axis = 1 root = [0]
     : (tensor<3x4xf32>) -> tensor<3x5xf32>
   return %0 : tensor<3x5xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 1)
-
-func.func @gather_invalid_gather_axis_dynamic_dimension(
-    %arg0 : tensor<?xf32>) -> tensor<3xf32> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 3.}}
-  %0 = mesh.gather %arg0 on @mesh0 gather_axis = 0 root = []
-    : (tensor<?xf32>) -> tensor<3xf32>
-  return %0 : tensor<3xf32>
 }
 
 // -----
@@ -740,36 +651,12 @@ func.func @reduce_scatter_duplicate_mesh_axis(
 
 mesh.mesh @mesh0(shape = 3)
 
-func.func @reduce_scatter_invalid_dynamic_dimension(
-    %arg0 : tensor<?xf32>) -> tensor<2xf64> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 2.}}
-  %0 = mesh.reduce_scatter %arg0 on @mesh0 scatter_axis = 0
-    : tensor<?xf32> -> tensor<2xf64>
-  return %0 : tensor<2xf64>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
 func.func @reduce_scatter_invalid_static_dimension_size(
     %arg0 : tensor<3xf32>) -> tensor<2xf64> {
   // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected 1, but got 2.}}
   %0 = mesh.reduce_scatter %arg0 on @mesh0 mesh_axes = [0] scatter_axis = 0
     : tensor<3xf32> -> tensor<2xf64>
   return %0 : tensor<2xf64>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
-func.func @reduce_scatter_invalid_operand_static_dimension_size(
-    %arg0 : tensor<4xf32>) -> tensor<?xf64> {
-  // expected-error@+1 {{Operand dimension size 4 is not divisible by collective device group size 3 for tensor axis 0.}}
-  %0 = mesh.reduce_scatter %arg0 on @mesh0 mesh_axes = [0] scatter_axis = 0
-    : tensor<4xf32> -> tensor<?xf64>
-  return %0 : tensor<?xf64>
 }
 
 // -----
@@ -789,19 +676,6 @@ func.func @scatter_duplicate_mesh_axis(
 
 mesh.mesh @mesh0(shape = 3)
 
-func.func @scatter_invalid_dynamic_dimension(
-    %arg0 : tensor<?xf32>) -> tensor<2xf32> {
-  // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected dynamic, but got 2.}}
-  %0 = mesh.scatter %arg0 on @mesh0
-    scatter_axis = 0 root = []
-    : (tensor<?xf32>) -> tensor<2xf32>
-  return %0 : tensor<2xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
 func.func @scatter_invalid_static_dimension_size(
     %arg0 : tensor<3xf32>) -> tensor<2xf32> {
   // expected-error@+1 {{Dimension size mismatch for result axis 0. Expected 1, but got 2.}}
@@ -809,19 +683,6 @@ func.func @scatter_invalid_static_dimension_size(
     scatter_axis = 0 root = [1]
     : (tensor<3xf32>) -> tensor<2xf32>
   return %0 : tensor<2xf32>
-}
-
-// -----
-
-mesh.mesh @mesh0(shape = 3)
-
-func.func @scatter_invalid_operand_static_dimension_size(
-    %arg0 : tensor<4xf32>) -> tensor<?xf32> {
-  // expected-error@+1 {{Operand dimension size 4 is not divisible by collective device group size 3 for tensor axis 0.}}
-  %0 = mesh.scatter %arg0 on @mesh0 mesh_axes = [0]
-    scatter_axis = 0 root = [1]
-    : (tensor<4xf32>) -> tensor<?xf32>
-  return %0 : tensor<?xf32>
 }
 
 // -----

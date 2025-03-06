@@ -75,6 +75,31 @@ static DimensionSize operator*(DimensionSize lhs, DimensionSize rhs) {
   return lhs.value() * rhs.value();
 }
 
+/// Converts a vector of OpFoldResults (ints) into vector of Values of the
+/// provided type.
+SmallVector<Value> mlir::mesh::getMixedAsValues(OpBuilder b,
+                                                const Location &loc,
+                                                llvm::ArrayRef<int64_t> statics,
+                                                ValueRange dynamics,
+                                                Type type) {
+  SmallVector<Value> values;
+  auto dyn = dynamics.begin();
+  Type i64 = b.getI64Type();
+  if (!type)
+    type = i64;
+  assert((i64 == type || b.getIndexType() == type) &&
+         "expected an i64 or an intex type");
+  for (auto s : statics) {
+    if (s == ShapedType::kDynamic) {
+      values.emplace_back(*(dyn++));
+    } else {
+      TypedAttr val = type == i64 ? b.getI64IntegerAttr(s) : b.getIndexAttr(s);
+      values.emplace_back(b.create<arith::ConstantOp>(loc, type, val));
+    }
+  }
+  return values;
+};
+
 //===----------------------------------------------------------------------===//
 // Inliner
 //===----------------------------------------------------------------------===//
@@ -536,7 +561,8 @@ LogicalResult ShardingOp::verify() {
     return success();
   };
 
-  for (auto subAxes : getSplitAxes().getAxes()) {
+  auto splitAxes = getSplitAxes().getAxes();
+  for (auto subAxes : splitAxes) {
     ArrayRef<MeshAxis> subAxesArray = subAxes.asArrayRef();
     if (failed(checkMeshAxis(subAxesArray)))
       return failure();
@@ -550,8 +576,8 @@ LogicalResult ShardingOp::verify() {
   }
 
   if (!getStaticHaloSizes().empty()) {
-    auto numSplitAxes = getSplitAxes().getAxes().size();
-    for (auto splitAxis : getSplitAxes().getAxes()) {
+    auto numSplitAxes = splitAxes.size();
+    for (auto splitAxis : splitAxes) {
       if (splitAxis.empty()) {
         --numSplitAxes;
       }
@@ -1040,12 +1066,10 @@ static LogicalResult verifyDimensionCompatibility(Location loc,
                                                   int64_t resultDimSize,
                                                   int64_t resultAxis) {
   if (!ShapedType::isDynamic(resultDimSize) &&
+      !ShapedType::isDynamic(expectedDimSize) &&
       expectedDimSize != resultDimSize) {
     return emitError(loc) << "Dimension size mismatch for result axis "
-                          << resultAxis << ". Expected "
-                          << (ShapedType::isDynamic(expectedDimSize)
-                                  ? Twine("dynamic")
-                                  : Twine(expectedDimSize))
+                          << resultAxis << ". Expected " << expectedDimSize
                           << ", but got " << resultDimSize << ".";
   }
 
@@ -1143,16 +1167,8 @@ static LogicalResult verifyScatterOrSliceOperandAndResultShape(
       DimensionSize(collectiveProcessGroupSize(meshAxes, meshShape));
   auto operandScatterDimSize =
       DimensionSize(operandType.getDimSize(tensorAxis));
-  if (!operandScatterDimSize.isDynamic() && !deviceGroupSize.isDynamic() &&
-      int64_t(operandScatterDimSize) % int64_t(deviceGroupSize) != 0) {
-    return emitError(result.getLoc())
-           << "Operand dimension size " << int64_t(operandScatterDimSize)
-           << " is not divisible by collective device group size "
-           << int64_t(deviceGroupSize) << " for tensor axis " << tensorAxis
-           << ".";
-  }
   DimensionSize expectedResultTensorDimSize =
-      operandScatterDimSize / deviceGroupSize;
+      shardDimension(operandScatterDimSize, deviceGroupSize);
   if (failed(verifyDimensionCompatibility(
           result.getLoc(), expectedResultTensorDimSize.value(),
           resultType.getDimSize(tensorAxis), tensorAxis))) {
@@ -1171,10 +1187,9 @@ static RankedTensorType sliceResultType(Type operandType, MeshOp mesh,
       operandRankedTensorType.getShape()[sliceAxis];
   SmallVector<int64_t> resultShape =
       llvm::to_vector(operandRankedTensorType.getShape());
+  resultShape[sliceAxis] = shardDimension(
+      operandSliceAxisSize, collectiveProcessGroupSize(meshAxes, mesh));
 
-  resultShape[sliceAxis] =
-      operandSliceAxisSize /
-      DimensionSize(collectiveProcessGroupSize(meshAxes, mesh));
   return operandRankedTensorType.clone(resultShape);
 }
 

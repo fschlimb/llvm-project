@@ -173,19 +173,11 @@ int64_t collectiveProcessGroupSize(MeshAxesRange &&meshAxes, MeshOp mesh) {
 
 // Get the size of a sharded dimension.
 inline int64_t shardDimension(int64_t dimSize, int64_t shardCount) {
-  if (ShapedType::isDynamic(dimSize) || ShapedType::isDynamic(shardCount))
+  if (ShapedType::isDynamic(dimSize) || ShapedType::isDynamic(shardCount) ||
+      dimSize % shardCount != 0)
     return ShapedType::kDynamic;
 
-  assert(dimSize % shardCount == 0);
   return dimSize / shardCount;
-}
-
-// Get the size of an unsharded dimension.
-inline int64_t gatherDimension(int64_t dimSize, int64_t shardCount) {
-  if (ShapedType::isDynamic(dimSize) || ShapedType::isDynamic(shardCount))
-    return ShapedType::kDynamic;
-
-  return dimSize * shardCount;
 }
 
 // Return the sharded shape `shape` according ot sharding `sharding`.
@@ -214,6 +206,12 @@ void maybeInsertTargetShardingAnnotation(MeshSharding sharding, OpResult result,
 void maybeInsertSourceShardingAnnotation(MeshSharding sharding,
                                          OpOperand &operand,
                                          OpBuilder &builder);
+
+/// Converts a vector of OpFoldResults (ints) into vector of Values of the
+/// provided type.
+SmallVector<Value> getMixedAsValues(OpBuilder b, const Location &loc,
+                                    llvm::ArrayRef<int64_t> statics,
+                                    ValueRange dynamics, Type type = Type());
 
 } // namespace mesh
 } // namespace mlir

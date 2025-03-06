@@ -8,6 +8,7 @@
 
 #include "mlir/Dialect/Mesh/Transforms/Spmdization.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Mesh/IR/MeshDialect.h"
 #include "mlir/Dialect/Mesh/IR/MeshOps.h"
@@ -247,10 +248,11 @@ static MeshSharding targetShardingInUnsplitLastAxis(MLIRContext *ctx,
 }
 
 static ShapedType allGatherResultShapeInUnsplitLastAxis(
-    ShapedType sourceShape, int64_t splitCount, int64_t splitTensorAxis) {
+    ShapedType sourceUnshardedShape, ShapedType sourceShape, int64_t splitCount,
+    int64_t splitTensorAxis) {
   SmallVector<int64_t> targetShape = llvm::to_vector(sourceShape.getShape());
   targetShape[splitTensorAxis] =
-      gatherDimension(targetShape[splitTensorAxis], splitCount);
+      sourceUnshardedShape.getDimSize(splitTensorAxis);
   return sourceShape.cloneWith(targetShape, sourceShape.getElementType());
 }
 
@@ -266,7 +268,8 @@ unsplitLastAxisInResharding(ImplicitLocOpBuilder &builder,
   MeshSharding targetSharding =
       targetShardingInUnsplitLastAxis(ctx, sourceSharding, splitTensorAxis);
   ShapedType allGatherResultShape = allGatherResultShapeInUnsplitLastAxis(
-      sourceShard.getType(), mesh.getShape()[splitMeshAxis], splitTensorAxis);
+      sourceUnshardedShape, sourceShard.getType(),
+      mesh.getShape()[splitMeshAxis], splitTensorAxis);
   Value allGatherResult = builder.create<AllGatherOp>(
       RankedTensorType::get(allGatherResultShape.getShape(),
                             allGatherResultShape.getElementType()),
@@ -373,13 +376,12 @@ static MeshSharding targetShardingInMoveLastAxis(MLIRContext *ctx,
       sourceSharding.getPartialAxes(), sourceSharding.getPartialType());
 }
 
-static ShapedType allToAllResultShapeInMoveLastAxis(ShapedType sourceShape,
-                                                    int64_t splitCount,
-                                                    int64_t sourceTensorAxis,
-                                                    int64_t targetTensorAxis) {
+static ShapedType allToAllResultShapeInMoveLastAxis(
+    ShapedType sourceUnshardedShape, ShapedType sourceShape, int64_t splitCount,
+    int64_t sourceTensorAxis, int64_t targetTensorAxis) {
   SmallVector<int64_t> targetShape = llvm::to_vector(sourceShape.getShape());
   targetShape[sourceTensorAxis] =
-      gatherDimension(targetShape[sourceTensorAxis], splitCount);
+      sourceUnshardedShape.getDimSize(sourceTensorAxis);
   targetShape[targetTensorAxis] =
       shardDimension(targetShape[targetTensorAxis], splitCount);
   return sourceShape.cloneWith(targetShape, sourceShape.getElementType());
@@ -398,8 +400,8 @@ moveLastSplitAxisInResharding(ImplicitLocOpBuilder &builder, MeshOp mesh,
   MeshSharding targetSharding = targetShardingInMoveLastAxis(
       ctx, sourceSharding, sourceTensorAxis, targetTensorAxis);
   ShapedType allToAllResultShape = allToAllResultShapeInMoveLastAxis(
-      sourceShard.getType(), mesh.getShape()[meshAxis], sourceTensorAxis,
-      targetTensorAxis);
+      sourceUnshardedShape, sourceShard.getType(), mesh.getShape()[meshAxis],
+      sourceTensorAxis, targetTensorAxis);
   Value allToAllResult = builder.create<AllToAllOp>(
       RankedTensorType::get(allToAllResultShape.getShape(),
                             allToAllResultShape.getElementType()),
@@ -450,58 +452,84 @@ tryUpdateHaloInResharding(ImplicitLocOpBuilder &builder, MeshOp mesh,
     return std::nullopt;
   }
 
-  auto srcHaloSizes = sourceSharding.getStaticHaloSizes();
-  auto tgtHaloSizes = targetSharding.getStaticHaloSizes();
+  Location loc = sourceShard.getLoc();
+  Type index = builder.getIndexType();
+  SmallVector<Value> srcHaloSizes =
+      getMixedAsValues(builder, loc, sourceSharding.getStaticHaloSizes(),
+                       sourceSharding.getDynamicHaloSizes(), index);
+  SmallVector<Value> tgtHaloSizes =
+      getMixedAsValues(builder, loc, targetSharding.getStaticHaloSizes(),
+                       targetSharding.getDynamicHaloSizes(), index);
   assert(srcHaloSizes.empty() || srcHaloSizes.size() == tgtHaloSizes.size());
-  assert(((srcHaloSizes.empty() || !ShapedType::isDynamicShape(srcHaloSizes)) &&
-          !ShapedType::isDynamicShape(tgtHaloSizes) &&
-          sourceShard.getType().hasStaticShape()) &&
-         "dynamic shapes/halos are not supported yet for mesh-spmdization");
-  auto rank = sourceShard.getType().getRank();
+  int64_t rank = sourceShard.getType().getRank();
   auto splitAxes = sourceSharding.getSplitAxes();
-  SmallVector<int64_t> srcCoreOffs(rank, 0), tgtCoreOffs(rank, 0),
-      strides(rank, 1), outShape(sourceShard.getType().getShape()),
-      coreShape(sourceShard.getType().getShape());
+
+  Value zero =
+      builder.createOrFold<arith::ConstantOp>(loc, builder.getIndexAttr(0));
+  SmallVector<Value> coreShape, srcCoreOffs(rank, zero),
+      tgtCoreOffs(rank, zero);
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    Value i =
+        builder.createOrFold<arith::ConstantOp>(loc, builder.getIndexAttr(dim));
+    Value dimSz = builder.createOrFold<tensor::DimOp>(loc, sourceShard, i);
+    coreShape.emplace_back(dimSz);
+  }
+  SmallVector<Value> outShape = coreShape;
 
   // Determine "core" of source and destination.
   // The core is the local part of the shard excluding halo regions.
-  for (auto i = 0u; i < rank; ++i) {
-    if (i < splitAxes.size() && !splitAxes[i].empty()) {
+  for (int64_t i = 0; i < rank; ++i) {
+    if (i < static_cast<int64_t>(splitAxes.size()) && !splitAxes[i].empty()) {
       if (!srcHaloSizes.empty()) {
-        coreShape[i] -= srcHaloSizes[i * 2] + srcHaloSizes[i * 2 + 1];
+        Value srcHaloSz = builder.createOrFold<arith::AddIOp>(
+            loc, srcHaloSizes[i * 2], srcHaloSizes[i * 2 + 1]);
+        coreShape[i] =
+            builder.createOrFold<arith::SubIOp>(loc, coreShape[i], srcHaloSz);
         srcCoreOffs[i] = srcHaloSizes[i * 2];
       }
-      tgtCoreOffs[i] = tgtHaloSizes[i * 2];
+      outShape[i] = coreShape[i];
+      Value tgtHaloSz = builder.createOrFold<arith::AddIOp>(
+          loc, tgtHaloSizes[i * 2], tgtHaloSizes[i * 2 + 1]);
       outShape[i] =
-          coreShape[i] + tgtHaloSizes[i * 2] + tgtHaloSizes[i * 2 + 1];
+          builder.createOrFold<arith::AddIOp>(loc, outShape[i], tgtHaloSz);
+      tgtCoreOffs[i] = tgtHaloSizes[i * 2];
     }
   }
 
+  // Get static dims form folded values and limit outShape to dyn dims only.
+  SmallVector<int64_t> staticOutShape;
+  int lastDyn = 0;
+  for (Value v : outShape) {
+    int64_t sz = ::mlir::getConstantIntValue(v).value_or(ShapedType::kDynamic);
+    staticOutShape.emplace_back(sz);
+    if (sz == ShapedType::kDynamic)
+      outShape[lastDyn++] = v;
+  }
+  outShape.resize(lastDyn);
+
   // Extract core from source and copy into destination core.
-  auto noVals = ValueRange{};
-  auto initVal = builder.create<tensor::EmptyOp>(
-      sourceShard.getLoc(), outShape, sourceShard.getType().getElementType());
-  auto core = builder.create<tensor::ExtractSliceOp>(
-      sourceShard.getLoc(),
-      RankedTensorType::get(coreShape, sourceShard.getType().getElementType()),
-      sourceShard, noVals, noVals, noVals, srcCoreOffs, coreShape, strides);
-  auto initOprnd = builder.create<tensor::InsertSliceOp>(
-      sourceShard.getLoc(), core, initVal, noVals, noVals, noVals, tgtCoreOffs,
-      coreShape, strides);
+  SmallVector<int64_t> dynamic(rank, ShapedType::kDynamic), strides(rank, 1);
+  ValueRange noVals;
+  Value initVal = builder.create<tensor::EmptyOp>(
+      loc, staticOutShape, sourceShard.getType().getElementType(), outShape);
+  Value core = builder.create<tensor::ExtractSliceOp>(
+      loc,
+      RankedTensorType::get(dynamic, sourceShard.getType().getElementType()),
+      sourceShard, srcCoreOffs, coreShape, noVals, dynamic, dynamic, strides);
+  Value initOprnd = builder.create<tensor::InsertSliceOp>(
+      loc, core, initVal, tgtCoreOffs, coreShape, noVals, dynamic, dynamic,
+      strides);
 
   // Finally update the halo.
-  auto updateHaloResult =
-      builder
-          .create<UpdateHaloOp>(
-              sourceShard.getLoc(),
-              RankedTensorType::get(outShape,
-                                    sourceShard.getType().getElementType()),
-              initOprnd, mesh.getSymName(),
-              MeshAxesArrayAttr::get(builder.getContext(),
-                                     sourceSharding.getSplitAxes()),
-              targetSharding.getDynamicHaloSizes(),
-              targetSharding.getStaticHaloSizes())
-          .getResult();
+  Value updateHaloResult = builder.create<UpdateHaloOp>(
+      loc,
+      RankedTensorType::get(staticOutShape,
+                            sourceShard.getType().getElementType()),
+      initOprnd, mesh.getSymName(),
+      MeshAxesArrayAttr::get(builder.getContext(),
+                             sourceSharding.getSplitAxes()),
+      targetSharding.getDynamicHaloSizes(),
+      targetSharding.getStaticHaloSizes());
   return std::make_tuple(cast<TypedValue<ShapedType>>(updateHaloResult),
                          targetSharding);
 }
