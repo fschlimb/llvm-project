@@ -98,7 +98,7 @@ SmallVector<Value> mlir::mesh::getMixedAsValues(OpBuilder b,
     }
   }
   return values;
-};
+}
 
 //===----------------------------------------------------------------------===//
 // Inliner

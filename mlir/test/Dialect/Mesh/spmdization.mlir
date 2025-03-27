@@ -402,8 +402,8 @@ func.func @ew_chain_with_halo_odd(
   %sharding_annotated_2 = mesh.shard %1 to %ssharding_annotated_2  : tensor<11x16xf32>
   %ssharding_annotated_4 = mesh.sharding @mesh_1d_4 split_axes = [[0]] halo_sizes = [2, 1] : !mesh.sharding
   %sharding_annotated_4 = mesh.shard %sharding_annotated_2 to %ssharding_annotated_4  annotate_for_users : tensor<11x16xf32>
-  // CHECK-NEXT: %[[TMP3:.*]] = tosa.negate %[[TMP2]] : (tensor<?x16xf32>) -> tensor<?x16xf32>
-  %2 = tosa.negate %sharding_annotated_4 : (tensor<11x16xf32>) -> tensor<11x16xf32>
+  // CHECK-NEXT: %[[TMP3:.*]] = tosa.ceil %[[TMP2]] : (tensor<?x16xf32>) -> tensor<?x16xf32>
+  %2 = tosa.ceil %sharding_annotated_4 : (tensor<11x16xf32>) -> tensor<11x16xf32>
   %ssharding_annotated_5 = mesh.sharding @mesh_1d_4 split_axes = [[0]] halo_sizes = [2, 1] : !mesh.sharding
   %sharding_annotated_5 = mesh.shard %2 to %ssharding_annotated_5  : tensor<11x16xf32>
   %ssharding_annotated_6 = mesh.sharding @mesh_1d_4 split_axes = [[0]] halo_sizes = [2, 1] : !mesh.sharding
