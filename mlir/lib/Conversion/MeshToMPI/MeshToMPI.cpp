@@ -591,11 +591,14 @@ struct ConvertAllReduceOp : public OpConversionPattern<AllReduceOp> {
         iBuilder.create<mpi::CommSplitOp>(commType, commWorld, color, key)
             .getNewcomm();
 
-    // collapse shape to 1d
-    ReassociationIndices reassociation(inType.getRank());
-    std::iota(reassociation.begin(), reassociation.end(), 0);
-    Value buffer1d = iBuilder.create<memref::CollapseShapeOp>(
-        buffer, ArrayRef<ReassociationIndices>(reassociation));
+    Value buffer1d = buffer;
+    // Collapse shape to 1d if needed
+    if (inType.getRank() > 1) {
+      ReassociationIndices reassociation(inType.getRank());
+      std::iota(reassociation.begin(), reassociation.end(), 0);
+      buffer1d = iBuilder.create<memref::CollapseShapeOp>(
+          buffer, ArrayRef<ReassociationIndices>(reassociation));
+    }
 
     // Create the MPI AllReduce operation.
     iBuilder.create<mpi::AllReduceOp>(
