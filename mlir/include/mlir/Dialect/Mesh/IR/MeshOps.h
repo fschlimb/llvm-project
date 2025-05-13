@@ -25,6 +25,8 @@ namespace mesh {
 
 using MeshAxis = int16_t;
 using MeshAxesAttr = DenseI16ArrayAttr;
+using ShardingArray = SmallVector<SmallVector<MeshAxis>>;
+using ShardingArrayRef = ArrayRef<SmallVector<MeshAxis>>;
 using ShardShapeAttr = DenseI64ArrayAttr;
 using HaloSizePairAttr = DenseI64ArrayAttr;
 
@@ -49,9 +51,11 @@ private:
   SmallVector<int64_t> static_sharded_dims_offsets;
   SmallVector<Value> dynamic_halo_sizes;
   SmallVector<Value> dynamic_sharded_dims_offsets;
+  bool empty = true;
 
 public:
-  MeshSharding(::mlir::FlatSymbolRefAttr mesh_ = nullptr);
+  MeshSharding(::mlir::FlatSymbolRefAttr mesh_ = nullptr,
+               ShardingArrayRef split_axes = {});
   MeshSharding(Value rhs);
   static MeshSharding get(::mlir::FlatSymbolRefAttr mesh_,
                           ArrayRef<MeshAxesAttr> split_axes_,
@@ -74,7 +78,6 @@ public:
   ArrayRef<Value> getDynamicShardedDimsOffsets() const {
     return dynamic_sharded_dims_offsets;
   }
-  operator bool() const { return (!mesh) == false; }
   bool operator==(Value rhs) const;
   bool operator!=(Value rhs) const;
   bool operator==(const MeshSharding &rhs) const;
@@ -83,6 +86,10 @@ public:
   bool equalHaloAndShardSizes(const MeshSharding &rhs) const;
   bool equalHaloSizes(const MeshSharding &rhs) const;
   bool equalShardSizes(const MeshSharding &rhs) const;
+  bool isEmpty() const { return empty; }
+  void makeEmpty() { empty = true; }
+  // Is the same tensor replicated on all processes.
+  bool isFullReplication() const;
 };
 
 } // namespace mesh
@@ -106,14 +113,6 @@ template <typename T>
 void removeTrailingEmptySubArray(SmallVector<SmallVector<T>> &array) {
   while (array.size() > 1 && array.back().empty())
     array.pop_back();
-}
-
-// Is the same tensor replicated on all processes.
-inline bool isFullReplication(MeshSharding sharding) {
-  return sharding.getPartialAxes().empty() &&
-         llvm::all_of(sharding.getSplitAxes(), [](MeshAxesAttr axes) {
-           return axes.asArrayRef().empty();
-         });
 }
 
 inline mesh::MeshOp

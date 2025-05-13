@@ -4,15 +4,14 @@ mesh.mesh @mesh_1d(shape = 2)
 mesh.mesh @mesh_1d_dynamic(shape = ?)
 
 // CHECK-LABEL: func @same_source_and_target_sharding
-func.func @same_source_and_target_sharding(
-  // CHECK-SAME: %[[ARG:.*]]: tensor<2xf32>
-  %arg0: tensor<2xf32>
-) -> tensor<2xf32> {
+func.func @same_source_and_target_sharding() -> tensor<2xf32> {
+  // CHECK: %[[ARG:.*]] = tensor.empty() : tensor<2xf32>
+  %arg0 = tensor.empty() : tensor<2xf32>
   %s0 = mesh.sharding @mesh_1d split_axes = [[]] : !mesh.sharding
   %0 = mesh.shard %arg0 to %s0 : tensor<2xf32>
   %s1 = mesh.sharding @mesh_1d split_axes = [[]] : !mesh.sharding
   %1 = mesh.shard %0 to %s1 annotate_for_users : tensor<2xf32>
-  // CHECK: return %[[ARG]]
+  // CHECK-NEXT: return %[[ARG]]
   return %1 : tensor<2xf32>
 }
 

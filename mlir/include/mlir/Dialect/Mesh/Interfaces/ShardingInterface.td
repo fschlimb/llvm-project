@@ -81,7 +81,7 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
           op to select the most appropriate shardings for all the operands
           and results and the op itself.
         }],
-        /*retTy=*/"FailureOr<ShardingOption>",
+        /*retTy=*/"FailureOr<MeshSharding>",
         /*methodName=*/"getShardingOption",
         /*args=*/(ins
           "ArrayRef<MeshSharding>": $operandShardings,
@@ -95,7 +95,7 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
       >,
       InterfaceMethod<
         /*desc=*/[{
-          Based on a given ShardingOption, get the operand and result
+          Based on a given shardingOption, get the operand and result
           operations for the operands and results sharding annotations.
           This is what shardings the operands and results need to have in order
           to shard the op according to shardingOption.
@@ -103,7 +103,7 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
         /*retTy=*/"FailureOr<std::vector<MeshSharding>>",
         /*methodName=*/"getShardingAnnotations",
         /*args=*/(ins
-          "const ShardingOption &":$shardingOption
+          "const MeshSharding &":$shardingOption
         ),
         /*methodBody=*/"",
         /*defaultImplementation=*/[{
@@ -113,7 +113,7 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
       >,
       InterfaceMethod<
         /*desc=*/[{
-          Based on a given ShardingOption, this method adds `mesh.shard`
+          Based on a given shardingOption, this method adds `mesh.shard`
           operations for the operands and results that previously lacked
           sharding annotations.
         }],
@@ -121,7 +121,7 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
         /*methodName=*/"addShardingAnnotations",
         /*args=*/(ins
           "OpBuilder &":$b,
-          "const ShardingOption &":$shardingOption
+          "const MeshSharding &":$shardingOption
         ),
         /*methodBody=*/"",
         /*defaultImplementation=*/[{

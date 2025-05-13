@@ -589,8 +589,9 @@ TypedValue<ShapedType> reshard(ImplicitLocOpBuilder &builder, MeshOp mesh,
                                TypedValue<ShapedType> sourceUnshardedValue,
                                TypedValue<ShapedType> sourceShard) {
   // If source and destination sharding are the same, no need to do anything.
-  if (sourceSharding == targetSharding || (isFullReplication(sourceSharding) &&
-                                           isFullReplication(targetSharding))) {
+  if (sourceSharding == targetSharding ||
+      (sourceSharding.isFullReplication() &&
+       targetSharding.isFullReplication())) {
     return sourceShard;
   }
 

@@ -36,7 +36,7 @@ namespace mesh {
 using namespace mlir;
 using namespace mlir::mesh;
 
-enum class ReshardingRquirementKind {
+enum class ReshardingRequirementKind {
   NO_RESHARDING = 0,
   NO_RESHARDING_FOR_EXPLICIT_ANNOTATIONS,
   RESHARDING_FOR_EXPLICIT_ANNOTATIONS
@@ -44,14 +44,18 @@ enum class ReshardingRquirementKind {
 
 #ifdef LLVM_DEBUG
 
-template <typename T>
+template <
+    typename T,
+    unsigned N = llvm::CalculateSmallVectorDefaultInlinedElements<T>::value>
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
-                                     const SmallVector<T> &vec);
+                                     const SmallVector<T, N> &vec);
 template <typename... Ts>
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
                                      const std::tuple<Ts...> &t);
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
-                                     ReshardingRquirementKind v);
+                                     ReshardingRequirementKind v);
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
+                                     ArrayRef<mlir::mesh::MeshAxesAttr> v);
 
 template <typename Stream, typename Range>
 static Stream &printRange(Stream &stream, Range &&range) {
@@ -63,16 +67,25 @@ static Stream &printRange(Stream &stream, Range &&range) {
   return stream << "]";
 }
 
-template <typename T>
+template <typename T, unsigned N>
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
-                                     const SmallVector<T> &vec) {
+                                     const SmallVector<T, N> &vec) {
   return printRange(stream, vec);
 }
 
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
+                                     ArrayRef<mlir::mesh::MeshAxesAttr> v) {
+  stream << "[";
+  for (auto &axes : v) {
+    stream << axes << ", ";
+  }
+  return stream << "]";
+}
+
 [[maybe_unused]] static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
-                                                      const ShardingOption &v) {
-  return stream << "{empty = " << v.empty << ", mesh" << v.mesh
-                << ", shardingArray = " << v.shardingArray << "}";
+                                                      const MeshSharding &v) {
+  return stream << "{empty = " << v.isEmpty() << ", mesh" << v.getMeshAttr()
+                << ", splitAxes = " << v.getSplitAxes() << "}";
 }
 
 template <typename Stream, typename... Ts, size_t... Is>
@@ -94,7 +107,7 @@ static llvm::raw_ostream &operator<<(llvm::raw_ostream &stream,
 }
 
 [[maybe_unused]] static llvm::raw_ostream &
-operator<<(llvm::raw_ostream &stream, ReshardingRquirementKind v) {
+operator<<(llvm::raw_ostream &stream, ReshardingRequirementKind v) {
   return stream << static_cast<int>(v);
 }
 
@@ -120,14 +133,14 @@ getOrderedPossibleShardingAttrs(ArrayRef<MeshSharding> mustShardings,
       return;
     }
 
-    if (mustShardings[i]) {
+    if (!mustShardings[i].isEmpty()) {
       curShardingAttrs.push_back(mustShardings[i]);
       dfsCreateShardingAttrs(i + 1);
       curShardingAttrs.pop_back();
       return;
     }
 
-    if (optionalShardings[i]) {
+    if (!optionalShardings[i].isEmpty()) {
       curShardingAttrs.push_back(optionalShardings[i]);
       dfsCreateShardingAttrs(i + 1);
       curShardingAttrs.pop_back();
@@ -156,9 +169,9 @@ getOrderedPossibleShardingAttrs(ArrayRef<MeshSharding> mustShardings,
 //     `annotate_for_users`.
 // 3. All other cases. Resharding is required for operands/results with
 //   annotation targeting explicitly this operation.
-ReshardingRquirementKind getReshardingRquirementKind(
+ReshardingRequirementKind getReshardingRequirementKind(
     Operation *op, const std::vector<MeshSharding> &operandAndResultShardings) {
-  ReshardingRquirementKind res = ReshardingRquirementKind::NO_RESHARDING;
+  ReshardingRequirementKind res = ReshardingRequirementKind::NO_RESHARDING;
 
   size_t operandsCount = op->getOperands().size();
   auto operandShardings =
@@ -179,9 +192,9 @@ ReshardingRquirementKind getReshardingRquirementKind(
     if (needsResharding) {
       if (isExplicitAnnotationForThisOp) {
         // This is the worst case. No need to continue.
-        return ReshardingRquirementKind::RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
+        return ReshardingRequirementKind::RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
       }
-      res = ReshardingRquirementKind::NO_RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
+      res = ReshardingRequirementKind::NO_RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
     }
   }
 
@@ -197,9 +210,9 @@ ReshardingRquirementKind getReshardingRquirementKind(
       if (needsResharding) {
         if (isExplicitAnnotationForThisOp) {
           // This is the worst case. No need to continue.
-          return ReshardingRquirementKind::RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
+          return ReshardingRequirementKind::RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
         }
-        res = ReshardingRquirementKind::NO_RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
+        res = ReshardingRequirementKind::NO_RESHARDING_FOR_EXPLICIT_ANNOTATIONS;
       }
     }
   }
@@ -214,19 +227,19 @@ ReshardingRquirementKind getReshardingRquirementKind(
 // 2. Resharding for values that have already annotations that do not target
 //    this op.
 // 3. Resharding of existing explicit sharding annotations for this op.
-static FailureOr<ShardingOption> selectShardingOption(
+static FailureOr<MeshSharding> selectShardingOption(
     ShardingInterface shardingOp,
     ArrayRef<std::vector<MeshSharding>> possibleOperandShardingAttrs,
     ArrayRef<std::vector<MeshSharding>> possibleResultShardingAttrs) {
-  SmallVector<std::tuple<ShardingOption, ReshardingRquirementKind>>
+  SmallVector<std::tuple<MeshSharding, ReshardingRequirementKind>, 4>
       shardingOptionsAndReshardingRequirements;
 
   for (ArrayRef<MeshSharding> resultShardings : possibleResultShardingAttrs) {
     for (ArrayRef<MeshSharding> operandShardings :
          possibleOperandShardingAttrs) {
-      FailureOr<ShardingOption> shardingOption =
+      FailureOr<MeshSharding> shardingOption =
           shardingOp.getShardingOption(operandShardings, resultShardings);
-      if (failed(shardingOption) || shardingOption->empty) {
+      if (failed(shardingOption) || shardingOption->isEmpty()) {
         continue;
       }
       // These shardings may not be the same as those in operandShardings and
@@ -243,9 +256,9 @@ static FailureOr<ShardingOption> selectShardingOption(
       // LLVM_DEBUG(DBGS() << "operandAndResultShardings = "
       //                   << *operandAndResultShardings << "\n";);
 
-      ReshardingRquirementKind reshardingRquirement =
-          getReshardingRquirementKind(shardingOp, *operandAndResultShardings);
-      if (reshardingRquirement == ReshardingRquirementKind::NO_RESHARDING) {
+      ReshardingRequirementKind reshardingRquirement =
+          getReshardingRequirementKind(shardingOp, *operandAndResultShardings);
+      if (reshardingRquirement == ReshardingRequirementKind::NO_RESHARDING) {
         // This is the best case. No need to go on.
         return *shardingOption;
       }
@@ -256,23 +269,23 @@ static FailureOr<ShardingOption> selectShardingOption(
   }
 
   if (shardingOptionsAndReshardingRequirements.empty()) {
-    return ShardingOption::makeEmpty();
+    return MeshSharding();
   }
 
   std::partial_sort(
       shardingOptionsAndReshardingRequirements.begin(),
       shardingOptionsAndReshardingRequirements.begin() + 1,
       shardingOptionsAndReshardingRequirements.end(),
-      [](const std::tuple<ShardingOption, ReshardingRquirementKind> &a,
-         const std::tuple<ShardingOption, ReshardingRquirementKind> &b) {
-        return std::get<ReshardingRquirementKind>(a) <
-               std::get<ReshardingRquirementKind>(b);
+      [](const std::tuple<MeshSharding, ReshardingRequirementKind> &a,
+         const std::tuple<MeshSharding, ReshardingRequirementKind> &b) {
+        return std::get<ReshardingRequirementKind>(a) <
+               std::get<ReshardingRequirementKind>(b);
       });
 
   LLVM_DEBUG(DBGS() << "shardingOptionsAndReshardingRequirements = "
                     << shardingOptionsAndReshardingRequirements << "\n";);
 
-  return std::get<ShardingOption>(
+  return std::get<MeshSharding>(
       shardingOptionsAndReshardingRequirements.front());
 }
 
@@ -336,7 +349,7 @@ static LogicalResult visitOp(Operation *op, OpBuilder &builder) {
   SmallVector<std::vector<MeshSharding>> possibleResultShardingAttrs =
       getOrderedPossibleShardingAttrs(resultMustShardings,
                                       allowConflictsResultShardings);
-  FailureOr<ShardingOption> shardingOption = selectShardingOption(
+  FailureOr<MeshSharding> shardingOption = selectShardingOption(
       shardingOp, possibleOperandShardingAttrs, possibleResultShardingAttrs);
 
   if (failed(shardingOption)) {
@@ -347,7 +360,7 @@ static LogicalResult visitOp(Operation *op, OpBuilder &builder) {
   LLVM_DEBUG(DBGS() << "Selected sharding option: " << *shardingOption << "\n");
 
   // sharding info is empty, return immediately
-  if (shardingOption->empty)
+  if (shardingOption->isEmpty())
     return success();
 
   if (failed(shardingOp.addShardingAnnotations(builder, *shardingOption))) {

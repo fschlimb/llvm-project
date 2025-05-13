@@ -48,13 +48,13 @@ struct ConstantShardingInterface
   // Indicate failure if no result sharding exists.
   // Otherwise mirror result sharding if it is a tensor constant.
   // Otherwise return replication option.
-  FailureOr<ShardingOption>
+  FailureOr<MeshSharding>
   getShardingOption(Operation *op, ArrayRef<MeshSharding> operandShardings,
                     ArrayRef<MeshSharding> resultShardings) const {
     assert(resultShardings.size() == 1 &&
            "Expecting exactly one result sharding for arith.constant");
     auto resultSharding = resultShardings[0];
-    if (!resultSharding) {
+    if (resultSharding.isEmpty()) {
       return failure();
     }
     if (auto type = dyn_cast<RankedTensorType>(op->getResult(0).getType())) {
@@ -62,9 +62,9 @@ struct ConstantShardingInterface
       for (auto [i, axes] : llvm::enumerate(resultSharding.getSplitAxes())) {
         axesArray[i].append(axes.asArrayRef().begin(), axes.asArrayRef().end());
       }
-      return ShardingOption(axesArray, resultSharding.getMeshAttr());
+      return MeshSharding(resultSharding.getMeshAttr(), axesArray);
     }
-    return ShardingOption({}, resultSharding.getMeshAttr());
+    return MeshSharding(resultSharding.getMeshAttr());
   }
 
   LogicalResult spmdize(Operation *op, ArrayRef<Value> spmdizedOperands,
@@ -75,7 +75,7 @@ struct ConstantShardingInterface
                         OpBuilder &builder) const {
     auto cOp = cast<ConstantOp>(op);
     if (auto value = dyn_cast<DenseIntOrFPElementsAttr>(cOp.getValue())) {
-      if (!value.isSplat() || !resultShardings[0]) {
+      if (!value.isSplat() || resultShardings[0].isEmpty()) {
         // Currently non-splat constants are not supported.
         return failure();
       }

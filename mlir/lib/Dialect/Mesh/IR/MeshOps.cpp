@@ -360,7 +360,7 @@ void mlir::mesh::maybeInsertSourceShardingAnnotation(MeshSharding sharding,
   {
     [[maybe_unused]] auto opType =
         dyn_cast<mlir::RankedTensorType>(operandValue.getType());
-    assert(!opType || opType.getRank() > 0 || isFullReplication(sharding));
+    assert(!opType || opType.getRank() > 0 || sharding.isFullReplication());
   }
   if (!isa<RankedTensorType>(operandValue.getType()) && operandSrcOp &&
       operandSrcOp->hasTrait<OpTrait::ConstantLike>()) {
@@ -782,7 +782,15 @@ bool MeshSharding::operator!=(const MeshSharding &rhs) const {
   return !(*this == rhs);
 }
 
-MeshSharding::MeshSharding(::mlir::FlatSymbolRefAttr mesh_) : mesh(mesh_) {}
+MeshSharding::MeshSharding(::mlir::FlatSymbolRefAttr mesh_,
+                           ShardingArrayRef split_axes_)
+    : mesh(mesh_), empty(!mesh_) {
+  if (!split_axes_.empty()) {
+    for (auto axes : split_axes_) {
+      split_axes.push_back(MeshAxesAttr::get(mesh_.getContext(), axes));
+    }
+  }
+}
 
 MeshSharding::MeshSharding(Value rhs) {
   auto shardingOp = mlir::dyn_cast<ShardingOp>(rhs.getDefiningOp());
@@ -792,6 +800,7 @@ MeshSharding::MeshSharding(Value rhs) {
   // If splitAxes and partialAxes are empty, use "empty" constructor.
   if (splitAxes.empty() && partialAxes.empty()) {
     *this = MeshSharding(shardingOp.getMeshAttr());
+    empty = false;
     return;
   }
   *this = get(shardingOp.getMeshAttr(), splitAxes, partialAxes,
@@ -833,7 +842,16 @@ MeshSharding MeshSharding::get(::mlir::FlatSymbolRefAttr mesh_,
   clone(dynamic_halo_sizes_, res.dynamic_halo_sizes);
   clone(dynamic_sharded_dims_offsets_, res.dynamic_sharded_dims_offsets);
 
+  res.empty = false;
+
   return res;
+}
+
+bool MeshSharding::isFullReplication() const {
+  return !isEmpty() && getPartialAxes().empty() &&
+         llvm::all_of(getSplitAxes(), [](MeshAxesAttr axes) {
+           return axes.asArrayRef().empty();
+         });
 }
 
 //===----------------------------------------------------------------------===//

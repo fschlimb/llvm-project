@@ -22,30 +22,6 @@ class SymbolTableCollection;
 
 namespace mesh {
 
-using ShardingArray = SmallVector<SmallVector<MeshAxis>>;
-using ShardingArrayRef = ArrayRef<SmallVector<MeshAxis>>;
-
-struct ShardingOption {
-  // An array of int array. The sub-array at the i-th position signifies the
-  // mesh axes the i-th loop will be sharded on.
-  ShardingArray shardingArray = {};
-  FlatSymbolRefAttr mesh = nullptr;
-  // `empty` being true indicates that no sharding information can be inferred
-  // at present. Note that it is different from the case where an operation is
-  // not sharded.
-  bool empty = false;
-  ShardingOption() = default;
-  ShardingOption(ShardingArray shardingArray, FlatSymbolRefAttr mesh)
-      : shardingArray(std::move(shardingArray)), mesh(mesh) {
-    assert(this->mesh);
-  }
-  static ShardingOption makeEmpty() {
-    auto res = ShardingOption();
-    res.empty = true;
-    return res;
-  }
-};
-
 // This method retrieves the 'MeshSharding' from a given operation
 // result and includes the 'annotate_for_users' information.
 FailureOr<std::pair<bool, MeshSharding>> getMeshSharding(OpResult result);
@@ -56,17 +32,16 @@ FailureOr<std::pair<bool, MeshSharding>> getMeshSharding(OpOperand &opOperand);
 
 namespace detail {
 
-FailureOr<ShardingOption>
+FailureOr<MeshSharding>
 defaultGetShardingOption(Operation *op, ArrayRef<MeshSharding> operandShardings,
                          ArrayRef<MeshSharding> resultShardings);
 
 FailureOr<std::vector<MeshSharding>>
 defaultGetShardingAnnotations(Operation *op,
-                              const ShardingOption &shardingOption);
+                              const MeshSharding &shardingOption);
 
-LogicalResult
-defaultAddShardingAnnotations(Operation *op, OpBuilder &b,
-                              const ShardingOption &shardingOption);
+LogicalResult defaultAddShardingAnnotations(Operation *op, OpBuilder &b,
+                                            const MeshSharding &shardingOption);
 
 } // namespace detail
 

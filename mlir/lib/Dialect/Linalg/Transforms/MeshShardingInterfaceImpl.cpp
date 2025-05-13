@@ -106,13 +106,13 @@ static MeshOp getMesh(Operation *op, ArrayRef<MeshSharding> operandShardings,
                       ArrayRef<MeshSharding> resultShardings,
                       SymbolTableCollection &symbolTable) {
   for (const MeshSharding &sharding : operandShardings) {
-    if (sharding) {
+    if (!sharding.isEmpty()) {
       return mesh::getMesh(op, sharding.getMeshAttr(), symbolTable);
     }
   }
 
   for (const MeshSharding &sharding : resultShardings) {
-    if (sharding) {
+    if (!sharding.isEmpty()) {
       return mesh::getMesh(op, sharding.getMeshAttr(), symbolTable);
     }
   }

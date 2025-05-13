@@ -223,46 +223,38 @@ void mesh::ShardingInterface::printLoopTypesAndIndexingMaps(raw_ostream &os) {
 namespace {
 
 // Update the given `shardingOption` according to `meshAxes` and `loopIdx`
-static LogicalResult fillShardingOption(Operation *op,
-                                        ShardingOption &shardingOption,
-                                        FlatSymbolRefAttr mesh,
-                                        ArrayRef<MeshAxis> meshAxes,
-                                        unsigned loopIdx) {
-  if ((shardingOption.mesh && mesh && shardingOption.mesh != mesh) ||
-      (!shardingOption.shardingArray[loopIdx].empty() &&
-       shardingOption.shardingArray[loopIdx] != meshAxes)) {
+static LogicalResult
+fillShardingOption(Operation *op, SmallVector<SmallVector<MeshAxis>> &splitAxes,
+                   ArrayRef<MeshAxis> meshAxes, unsigned loopIdx) {
+  if (!splitAxes[loopIdx].empty() && splitAxes[loopIdx] != meshAxes) {
     LLVM_DEBUG(DBGS() << "sharding option conflicts on loop iterator "
                       << loopIdx << "\n");
     return failure();
   }
-  for (size_t i = 0; i < shardingOption.shardingArray.size(); ++i) {
+  for (size_t i = 0; i < splitAxes.size(); ++i) {
     if (i == loopIdx)
       continue;
 
     for (MeshAxis axis : meshAxes) {
-      if (llvm::is_contained(shardingOption.shardingArray[i], axis)) {
+      if (llvm::is_contained(splitAxes[i], axis)) {
         LLVM_DEBUG(DBGS() << "sharding option conflicts because mesh axes "
                           << axis << " duplicate");
         return failure();
       }
     }
   }
-  if (mesh)
-    shardingOption.mesh = mesh;
-  if (shardingOption.shardingArray[loopIdx].empty())
-    shardingOption.shardingArray[loopIdx].append(meshAxes.begin(),
-                                                 meshAxes.end());
+  if (splitAxes[loopIdx].empty())
+    splitAxes[loopIdx].append(meshAxes.begin(), meshAxes.end());
   return success();
 }
 
 } // namespace
 
-FailureOr<ShardingOption>
+FailureOr<MeshSharding>
 mesh::detail::defaultGetShardingOption(Operation *op,
                                        ArrayRef<MeshSharding> operandShardings,
                                        ArrayRef<MeshSharding> resultShardings) {
   ShardingInterface shardingOp = llvm::cast<ShardingInterface>(op);
-  ShardingOption shardingOption;
 
   if (failed(shardingOp.verifyShardingInterfaceImpl()))
     return op->emitOpError() << "invalid sharding interface implementation";
@@ -270,20 +262,22 @@ mesh::detail::defaultGetShardingOption(Operation *op,
       shardingOp.getLoopIteratorTypes();
   SmallVector<AffineMap> maps = shardingOp.getIndexingMaps();
   unsigned numOperands = op->getNumOperands();
-  shardingOption.shardingArray.resize(loopTypes.size());
   llvm::SmallVector<MeshAxis> partialMeshAxes;
   llvm::SmallSet<unsigned, 4> visitedLoopIndices;
   bool anyShardingInResultsOrOperands = false;
 
+  FlatSymbolRefAttr mesh;
+  SmallVector<SmallVector<MeshAxis>> splitAxes(loopTypes.size());
+
   // 1. Fill sharding option based on op results
   for (auto shardingIt : llvm::enumerate(resultShardings)) {
     MeshSharding shardAttr = shardingIt.value();
-    if (!shardAttr)
+    if (shardAttr.isEmpty())
       continue;
     AffineMap map = maps[numOperands + shardingIt.index()];
     anyShardingInResultsOrOperands = true;
     if (shardAttr.getSplitAxes().empty() || map.getResults().empty()) {
-      shardingOption.mesh = shardAttr.getMeshAttr();
+      mesh = shardAttr.getMeshAttr();
     } else {
       // Handle the split axes: calculate the corresponding loop index for each
       // split axes sub-array, and then store the sub-array to
@@ -294,9 +288,14 @@ mesh::detail::defaultGetShardingOption(Operation *op,
         auto dim = cast<AffineDimExpr>(expr);
         unsigned index = dim.getPosition();
         visitedLoopIndices.insert(index);
-        if (failed(fillShardingOption(op, shardingOption,
-                                      shardAttr.getMeshAttr(), axes, index)))
+        if (failed(fillShardingOption(op, splitAxes, axes, index))) {
           return failure();
+        } else {
+          assert(!mesh || mesh == shardAttr.getMeshAttr() &&
+                              "mesh should be the same for all results");
+          if (!mesh)
+            mesh = shardAttr.getMeshAttr();
+        }
       }
     }
 
@@ -320,7 +319,7 @@ mesh::detail::defaultGetShardingOption(Operation *op,
   // 2. Fill sharding option based on operands
   for (auto shardingIt : llvm::enumerate(operandShardings)) {
     MeshSharding shardAttr = shardingIt.value();
-    if (!shardAttr)
+    if (shardAttr.isEmpty())
       continue;
 
     anyShardingInResultsOrOperands = !shardAttr.getSplitAxes().empty();
@@ -346,9 +345,14 @@ mesh::detail::defaultGetShardingOption(Operation *op,
       if (loopIndices->size() == 1) {
         unsigned loopIdx = *loopIndices->begin();
         visitedLoopIndices.insert(loopIdx);
-        if (failed(fillShardingOption(op, shardingOption,
-                                      shardAttr.getMeshAttr(), axes, loopIdx)))
+        if (failed(fillShardingOption(op, splitAxes, axes, loopIdx))) {
           return failure();
+        } else {
+          assert(!mesh || mesh == shardAttr.getMeshAttr() &&
+                              "mesh should be the same for all results");
+          if (!mesh)
+            mesh = shardAttr.getMeshAttr();
+        }
       }
       // If multiple loop indices correspond to a dimension of an operand, it is
       // difficult to infer which loop indices are responsible for sharding.
@@ -373,18 +377,16 @@ mesh::detail::defaultGetShardingOption(Operation *op,
 
   // 3. Finalize sharding option
   if (!partialMeshAxes.empty()) {
-    bool anyNonEmptyReductionLoop = llvm::any_of(
-        llvm::enumerate(shardingOption.shardingArray), [&](auto it) {
-          SmallVector<MeshAxis> &subArray = it.value();
+    bool anyNonEmptyReductionLoop =
+        llvm::any_of(llvm::enumerate(splitAxes), [&](auto it) {
           int64_t idx = it.index();
-          return isReductionLoop(loopTypes[idx]) && !subArray.empty();
+          return isReductionLoop(loopTypes[idx]) && !it.value().empty();
         });
     if (!anyNonEmptyReductionLoop) {
       bool filled = false;
       for (size_t idx = 0; idx < loopTypes.size(); ++idx) {
         if (isReductionLoop(loopTypes[idx])) {
-          std::ignore = fillShardingOption(op, shardingOption, nullptr,
-                                           partialMeshAxes, idx);
+          std::ignore = fillShardingOption(op, splitAxes, partialMeshAxes, idx);
           filled = true;
           break;
         }
@@ -394,14 +396,14 @@ mesh::detail::defaultGetShardingOption(Operation *op,
                                     "result's partial type";
     }
   }
-  removeTrailingEmptySubArray(shardingOption.shardingArray);
+  removeTrailingEmptySubArray(splitAxes);
   if (!anyShardingInResultsOrOperands)
-    shardingOption.empty = true;
-  return shardingOption;
+    return MeshSharding();
+  return MeshSharding(mesh, splitAxes);
 }
 
 // Get the sharding attributed for the given result and sharding option.
-MeshSharding getSharding(OpResult result, const ShardingOption &shardingOption,
+MeshSharding getSharding(OpResult result, const MeshSharding &shardingOption,
                          AffineMap map, ArrayRef<utils::IteratorType> loopTypes,
                          ArrayRef<ReductionKind> reductionLoopKinds) {
   auto resultType = cast<RankedTensorType>(result.getType());
@@ -415,15 +417,17 @@ MeshSharding getSharding(OpResult result, const ShardingOption &shardingOption,
     // isProjectedPermutation
     auto dim = cast<AffineDimExpr>(expr);
     unsigned loopIdx = dim.getPosition();
-    if (loopIdx < shardingOption.shardingArray.size())
-      splitAxes[it.index()].append(shardingOption.shardingArray[loopIdx]);
+    if (loopIdx < shardingOption.getSplitAxes().size()) {
+      auto axes = shardingOption.getSplitAxes()[loopIdx].asArrayRef();
+      splitAxes[it.index()].append(axes.begin(), axes.end());
+    }
   }
 
   // process the partial axes
   // partialType will be ignored if partialAxes is empty
   ReductionKind partialType = ReductionKind::Sum;
   size_t reductionLoopKindsIdx = 0;
-  for (auto it : llvm::zip(loopTypes, shardingOption.shardingArray)) {
+  for (auto it : llvm::zip(loopTypes, shardingOption.getSplitAxes())) {
     utils::IteratorType iType = std::get<0>(it);
     if (isReductionLoop(iType)) {
       ReductionKind curPartialType = reductionLoopKinds[reductionLoopKindsIdx];
@@ -432,19 +436,19 @@ MeshSharding getSharding(OpResult result, const ShardingOption &shardingOption,
         assert(partialType == curPartialType &&
                "Only one reduction type is supported");
       partialType = curPartialType;
-      const SmallVector<MeshAxis> &axis = std::get<1>(it);
-      partialAxes.append(axis);
+      auto axis = std::get<1>(it).asArrayRef();
+      partialAxes.append(axis.begin(), axis.end());
     }
   }
 
   removeTrailingEmptySubArray(splitAxes);
-  return MeshSharding::get(shardingOption.mesh,
+  return MeshSharding::get(shardingOption.getMeshAttr(),
                            fromArrayOfVector(result.getContext(), splitAxes),
                            partialAxes, partialType);
 }
 
 static FailureOr<MeshSharding> getSharding(OpOperand &opOperand,
-                                           const ShardingOption &shardingOption,
+                                           const MeshSharding &shardingOption,
                                            AffineMap map) {
   Value operandValue = opOperand.get();
   auto operandType = dyn_cast<RankedTensorType>(operandValue.getType());
@@ -455,7 +459,7 @@ static FailureOr<MeshSharding> getSharding(OpOperand &opOperand,
   }
   // 0d tensors cannot be sharded and must get replicated
   if (operandType.getRank() == 0) {
-    return MeshSharding(shardingOption.mesh);
+    return MeshSharding(shardingOption.getMeshAttr());
   }
   SmallVector<SmallVector<MeshAxis>> splitAxes(operandType.getRank());
   unsigned numDims = map.getNumDims();
@@ -468,28 +472,29 @@ static FailureOr<MeshSharding> getSharding(OpOperand &opOperand,
       return failure();
     SmallVector<unsigned> shardedLoopIndices;
     for (unsigned loopIdx : *loopIndices) {
-      if ((size_t)loopIdx < shardingOption.shardingArray.size() &&
-          !shardingOption.shardingArray[loopIdx].empty())
+      if ((size_t)loopIdx < shardingOption.getSplitAxes().size() &&
+          !shardingOption.getSplitAxes()[loopIdx].empty())
         shardedLoopIndices.push_back(loopIdx);
     }
     // mostly one sharded loop index is accepted
     if (shardedLoopIndices.size() > 1)
       return failure();
     if (shardedLoopIndices.size() == 1) {
-      splitAxes[idx].append(
-          shardingOption.shardingArray[shardedLoopIndices[0]]);
+      SmallVector<MeshAxis> splitAxesForIdx(
+          shardingOption.getSplitAxes()[shardedLoopIndices[0]].asArrayRef());
+      splitAxes[idx].append(splitAxesForIdx.begin(), splitAxesForIdx.end());
     }
   }
 
   removeTrailingEmptySubArray(splitAxes);
   return MeshSharding::get(
-      shardingOption.mesh,
+      shardingOption.getMeshAttr(),
       fromArrayOfVector(opOperand.get().getContext(), splitAxes));
 }
 
 FailureOr<std::vector<MeshSharding>>
 mesh::detail::defaultGetShardingAnnotations(
-    Operation *op, const ShardingOption &shardingOption) {
+    Operation *op, const MeshSharding &shardingOption) {
   std::vector<MeshSharding> res;
 
   ShardingInterface shardingOp = llvm::cast<ShardingInterface>(op);
@@ -524,7 +529,7 @@ mesh::detail::defaultGetShardingAnnotations(
 // To add a `mesh.shard` op for the given result, based on the details provided
 // in `shardingOption`, `map`, and `loopTypes`.
 static LogicalResult addShardOp(OpBuilder &b, OpResult result,
-                                const ShardingOption &shardingOption,
+                                const MeshSharding &shardingOption,
                                 AffineMap map,
                                 ArrayRef<utils::IteratorType> loopTypes,
                                 ArrayRef<ReductionKind> reductionLoopKinds) {
@@ -538,7 +543,7 @@ static LogicalResult addShardOp(OpBuilder &b, OpResult result,
 // To add a `mesh.shard` op for the given operand, based on the details provided
 // in `shardingOption`, `map`, and `loopTypes`.
 static LogicalResult addShardOp(OpBuilder &b, OpOperand &opOperand,
-                                const ShardingOption &shardingOption,
+                                const MeshSharding &shardingOption,
                                 AffineMap map) {
 
   FailureOr<MeshSharding> sharding =
@@ -553,8 +558,8 @@ static LogicalResult addShardOp(OpBuilder &b, OpOperand &opOperand,
 }
 
 LogicalResult mesh::detail::defaultAddShardingAnnotations(
-    Operation *op, OpBuilder &b, const ShardingOption &shardingOption) {
-  assert(!shardingOption.empty && shardingOption.mesh);
+    Operation *op, OpBuilder &b, const MeshSharding &shardingOption) {
+  assert(!shardingOption.isEmpty() && shardingOption.getMeshAttr());
 
   ShardingInterface shardingOp = llvm::cast<ShardingInterface>(op);
   SmallVector<utils::IteratorType> loopTypes =
@@ -587,10 +592,10 @@ static bool
 isValueCompatibleWithFullReplicationSharding(Value value,
                                              MeshSharding sharding) {
   if (isa<RankedTensorType>(value.getType())) {
-    return isFullReplication(sharding);
+    return sharding.isFullReplication();
   }
 
-  return !sharding;
+  return sharding.isEmpty();
 }
 
 template <typename ValueRange, typename MeshShardingRage>
@@ -652,7 +657,7 @@ ShardingArray mesh::getMeshAxisAssignmentForLoopIterators(
   llvm::append_range(operatorAndResultShardings, operandShardings);
   for (auto [sharding, affineMap] :
        llvm::zip_equal(operatorAndResultShardings, indexingMaps)) {
-    if (!sharding) {
+    if (sharding.isEmpty()) {
       continue;
     }
     for (auto [meshAxesAssignmentForTensorAxis, indexingExpr] :

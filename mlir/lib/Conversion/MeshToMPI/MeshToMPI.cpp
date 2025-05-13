@@ -541,7 +541,7 @@ struct ConvertAllReduceOp : public OpConversionPattern<AllReduceOp> {
     if (isa<RankedTensorType>(input.getType())) {
       auto memrefType = MemRefType::get(
           inputShape, cast<ShapedType>(input.getType()).getElementType());
-      input = iBuilder.create<bufferization::ToMemrefOp>(memrefType, input);
+      input = iBuilder.create<bufferization::ToBufferOp>(memrefType, input);
     }
     MemRefType inType = cast<MemRefType>(input.getType());
 
@@ -661,7 +661,7 @@ struct ConvertUpdateHaloOp : public OpConversionPattern<UpdateHaloOp> {
       auto mmemrefType = MemRefType::get(
           dstShape, cast<ShapedType>(array.getType()).getElementType());
       array =
-          rewriter.create<bufferization::ToMemrefOp>(loc, mmemrefType, array);
+          rewriter.create<bufferization::ToBufferOp>(loc, mmemrefType, array);
     }
     auto rank = cast<ShapedType>(array.getType()).getRank();
     auto opSplitAxes = adaptor.getSplitAxes().getAxes();
