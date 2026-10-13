@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Arith/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -38,12 +38,26 @@ static vector::ContractionOp getCandidate(scf::ForOp loop) {
       continue;
 
     auto iterators = contract.getIteratorTypesArray();
+    auto maps = contract.getIndexingMapsArray();
+    MLIRContext *ctx = contract.getContext();
+    auto m = getAffineDimExpr(0, ctx);
+    auto n = getAffineDimExpr(1, ctx);
+    auto k = getAffineDimExpr(2, ctx);
     auto par = vector::IteratorType::parallel;
     auto red = vector::IteratorType::reduction;
     if ((isRowMajorMatmul(contract.getIndexingMaps()) &&
-         llvm::equal(iterators, ArrayRef{par, par, red})) ||
-        (x86::isInVnniLayout(contract, contract.getIndexingMapsArray()) &&
-         llvm::equal(iterators, ArrayRef{par, par, red, red})))
+         llvm::equal(iterators, ArrayRef{par, par, red}) &&
+         maps[0] == AffineMap::get(3, 0, {m, k}, ctx) &&
+         maps[1] == AffineMap::get(3, 0, {k, n}, ctx) &&
+         maps[2] == AffineMap::get(3, 0, {m, n}, ctx)))
+      return contract;
+
+    auto v = getAffineDimExpr(3, ctx);
+    if (x86::isInVnniLayout(contract, maps) &&
+        llvm::equal(iterators, ArrayRef{par, par, red, red}) &&
+        maps[0] == AffineMap::get(4, 0, {m, k, v}, ctx) &&
+        maps[1] == AffineMap::get(4, 0, {k, n, v}, ctx) &&
+        maps[2] == AffineMap::get(4, 0, {m, n}, ctx))
       return contract;
   }
   return {};
@@ -80,6 +94,7 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
       if (indexUsers.empty())
         return failure();
 
+      // scf.for makes overflowing induction-variable values undefined.
       rewriter.setInsertionPoint(loop);
       Value lb = arith::IndexCastOp::create(rewriter, loop.getLoc(),
                                             rewriter.getIndexType(),
@@ -112,6 +127,7 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
       if (!fitsInSignedWidth(loop.getLowerBound(), width) ||
           !fitsInSignedWidth(loop.getUpperBound(), width))
         continue;
+      // All signed IV values lie between the two bounds.
       for (Operation *castUser : inner.getResult().getUsers()) {
         auto outer = dyn_cast<arith::IndexCastOp>(castUser);
         if (outer && outer.getType().isIndex()) {
@@ -131,6 +147,15 @@ struct ReadOffset {
   ValueDimList operands;
 };
 
+static bool isSimpleReadOutsideLoop(vector::TransferReadOp read,
+                                    scf::ForOp loop) {
+  return read && read->getParentOp() == loop &&
+         isa<MemRefType>(read.getBase().getType()) &&
+         loop.isDefinedOutsideOfLoop(read.getBase()) &&
+         read.getPermutationMap().isMinorIdentity() && !read.getMask() &&
+         !read.hasOutOfBoundsDim();
+}
+
 static bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
   Value lb = loop.getLowerBound(), ub = loop.getUpperBound();
   auto lower = getConstantIntValue(lb);
@@ -138,14 +163,8 @@ static bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
   if (lower && upper && *lower >= 0 && *upper >= 0)
     return true;
 
-  auto fromNarrowInt = [](Value value) {
-    auto cast = value.getDefiningOp<arith::IndexCastOp>();
-    return cast && isa<IntegerType>(cast.getIn().getType()) &&
-           cast.getIn().getType().getIntOrFloatBitWidth() <= 32;
-  };
-  return indexWidth > 32 &&
-         (fromNarrowInt(lb) || (lower && llvm::isIntN(32, *lower))) &&
-         (fromNarrowInt(ub) || (upper && llvm::isIntN(32, *upper)));
+  return indexWidth > 32 && fitsInSignedWidth(lb, 32) &&
+         fitsInSignedWidth(ub, 32);
 }
 
 struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
@@ -162,11 +181,7 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
     bool needsRebasing = false;
     for (Value operand : {contract.getLhs(), contract.getRhs()}) {
       auto read = operand.getDefiningOp<vector::TransferReadOp>();
-      if (!read || read->getParentOp() != loop ||
-          !isa<MemRefType>(read.getBase().getType()) ||
-          !loop.isDefinedOutsideOfLoop(read.getBase()) ||
-          !read.getPermutationMap().isMinorIdentity() || read.getMask() ||
-          read.hasOutOfBoundsDim())
+      if (!isSimpleReadOutsideLoop(read, loop))
         return failure();
 
       std::optional<unsigned> position;
@@ -196,7 +211,8 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
       if (failed(ValueBoundsConstraintSet::computeBound(
               bound, boundOperands, presburger::BoundType::EQ, delta, outside)))
         return failure();
-      if (llvm::any_of(boundOperands, [&](auto valueDim) {
+      if (bound.getNumResults() != 1 ||
+          llvm::any_of(boundOperands, [&](auto valueDim) {
             return valueDim.second ||
                    !loop.isDefinedOutsideOfLoop(valueDim.first);
           }))
@@ -212,30 +228,41 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
         !canShiftLowerBound(loop, DataLayout::closest(loop).getTypeSizeInBits(
                                       rewriter.getIndexType())))
       return failure();
+    for (ReadOffset &offset : offsets) {
+      if (!shift &&
+          offset.read.getIndices()[offset.position] == loop.getInductionVar())
+        continue;
+      SmallVector<int64_t> strides;
+      int64_t baseOffset;
+      if (failed(cast<MemRefType>(offset.read.getBase().getType())
+                     .getStridesAndOffset(strides, baseOffset)))
+        return failure();
+    }
 
     rewriter.setInsertionPoint(loop);
     Location loc = loop.getLoc();
     SmallVector<Value> subviews;
     for (ReadOffset &offset : offsets) {
+      if (!shift &&
+          offset.read.getIndices()[offset.position] == loop.getInductionVar()) {
+        subviews.push_back({});
+        continue;
+      }
       Value base = offset.read.getBase();
       auto type = cast<MemRefType>(base.getType());
       SmallVector<OpFoldResult> subOffsets, sizes, strides;
+      SmallVector<OpFoldResult> mapOperands;
+      for (auto valueDim : offset.operands)
+        mapOperands.push_back(valueDim.first);
       Value delta = getValueOrCreateConstantIndexOp(
           rewriter, loc,
-          *arith::reifyValueBound(
-              rewriter, loc, presburger::BoundType::EQ,
-              ValueBoundsConstraintSet::Variable(
-                  offset.map,
-                  llvm::map_to_vector(offset.operands,
-                                      [](auto pair) { return pair.first; })),
-              [&](Value value, std::optional<int64_t>,
-                  ValueBoundsConstraintSet &) {
-                return loop.isDefinedOutsideOfLoop(value);
-              }));
+          affine::makeComposedFoldedAffineApply(rewriter, loc, offset.map,
+                                                mapOperands));
       Value first =
           shift ? arith::AddIOp::create(rewriter, loc, lb, delta) : delta;
       Value dim = memref::DimOp::create(rewriter, loc, base, offset.position);
       Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      // The subview must stay in bounds even when the loop has zero trips.
       Value clamped = arith::MinSIOp::create(
           rewriter, loc, arith::MaxSIOp::create(rewriter, loc, first, zero),
           dim);
@@ -273,12 +300,177 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
     }
 
     for (unsigned i = 0; i < offsets.size(); ++i) {
+      if (!subviews[i])
+        continue;
       ReadOffset &offset = offsets[i];
       rewriter.modifyOpInPlace(offset.read, [&] {
-        offset.read->setOperand(0, subviews[i]);
-        offset.read->setOperand(1 + offset.position, iv);
+        offset.read.getBaseMutable().assign(subviews[i]);
+        SmallVector<Value> indices(offset.read.getIndices());
+        indices[offset.position] = iv;
+        offset.read.getIndicesMutable().assign(indices);
       });
     }
+    return success();
+  }
+};
+struct ExpandedRead {
+  vector::TransferReadOp read;
+  MemRefType type;
+  SmallVector<ReassociationIndices> reassociation;
+  int64_t lastIndex;
+};
+
+static std::optional<ExpandedRead>
+getExpandableRead(vector::TransferReadOp read, unsigned factor,
+                  scf::ForOp loop) {
+  if (!isSimpleReadOutsideLoop(read, loop))
+    return std::nullopt;
+  auto type = dyn_cast<MemRefType>(read.getBase().getType());
+  if (!type || type.getRank() < 2 || type.isDynamicDim(type.getRank() - 1) ||
+      type.getShape().back() % factor != 0)
+    return std::nullopt;
+  auto lastIndex = getConstantIntValue(read.getIndices().back());
+  if (!lastIndex || *lastIndex % factor != 0)
+    return std::nullopt;
+
+  SmallVector<int64_t> shape(type.getShape());
+  shape.back() /= factor;
+  shape.push_back(factor);
+  SmallVector<ReassociationIndices> reassociation;
+  for (int64_t i = 0; i < type.getRank(); ++i)
+    reassociation.push_back(i == type.getRank() - 1
+                                ? ReassociationIndices{i, i + 1}
+                                : ReassociationIndices{i});
+  FailureOr<MemRefType> expanded =
+      memref::ExpandShapeOp::computeExpandedType(type, shape, reassociation);
+  if (failed(expanded))
+    return std::nullopt;
+  return ExpandedRead{read, *expanded, reassociation, *lastIndex / factor};
+}
+
+static Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
+                               ExpandedRead &info, VectorType resultType) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(info.read->getParentOp());
+  Value expanded = memref::ExpandShapeOp::create(
+      rewriter, loc, info.type, info.read.getBase(), info.reassociation);
+  Value lastIndex =
+      arith::ConstantIndexOp::create(rewriter, loc, info.lastIndex);
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  rewriter.setInsertionPoint(info.read);
+  SmallVector<Value> indices(info.read.getIndices());
+  indices.back() = lastIndex;
+  indices.push_back(zero);
+  auto packed = vector::TransferReadOp::create(
+      rewriter, loc, resultType, expanded, indices, info.read.getPadding());
+  packed.setInBoundsAttr(
+      rewriter.getBoolArrayAttr(SmallVector<bool>(resultType.getRank(), true)));
+  return packed;
+}
+
+struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::ContractionOp contract,
+                                PatternRewriter &rewriter) const override {
+    auto loop = dyn_cast<scf::ForOp>(contract->getParentOp());
+    if (!loop || getCandidate(loop) != contract)
+      return failure();
+
+    auto lhsType = contract.getLhsType();
+    auto rhsType = contract.getRhsType();
+    auto accType = dyn_cast<VectorType>(contract.getAccType());
+    Type element = lhsType.getElementType();
+    if (!accType || lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
+        accType.getRank() != 2 || element != rhsType.getElementType() ||
+        !(element.isBF16() || element.isInteger(8)))
+      return failure();
+    unsigned factor = 32 / element.getIntOrFloatBitWidth();
+    if (lhsType.getDimSize(1) != rhsType.getDimSize(0) ||
+        lhsType.getDimSize(1) % factor != 0)
+      return failure();
+
+    auto shapeCast = contract.getRhs().getDefiningOp<vector::ShapeCastOp>();
+    auto transpose =
+        shapeCast ? shapeCast.getSource().getDefiningOp<vector::TransposeOp>()
+                  : vector::TransposeOp();
+    if (!transpose || transpose->getParentOp() != loop)
+      return failure();
+    VectorType rhsPackedType =
+        VectorType::get({lhsType.getDimSize(1) / factor, rhsType.getDimSize(1),
+                         int64_t(factor)},
+                        element);
+    auto sourceType = cast<VectorType>(transpose.getVector().getType());
+    if (sourceType.getRank() < rhsPackedType.getRank())
+      return failure();
+    unsigned leading = sourceType.getRank() - rhsPackedType.getRank();
+    if (!llvm::all_of(sourceType.getShape().take_front(leading),
+                      [](int64_t dim) { return dim == 1; }) ||
+        !llvm::equal(sourceType.getShape().drop_front(leading),
+                     rhsPackedType.getShape()))
+      return failure();
+    for (unsigned i = 0; i < leading + 1; ++i)
+      if (transpose.getPermutation()[i] != i)
+        return failure();
+    if (transpose.getPermutation()[leading + 1] != leading + 2 ||
+        transpose.getPermutation()[leading + 2] != leading + 1)
+      return failure();
+
+    auto lhsRead = contract.getLhs().getDefiningOp<vector::TransferReadOp>();
+    auto lhs = getExpandableRead(lhsRead, factor, loop);
+    auto broadcast = transpose.getVector().getDefiningOp<vector::BroadcastOp>();
+    Value packedSource =
+        broadcast ? broadcast.getSource() : transpose.getVector();
+    if (broadcast && packedSource.getType() != rhsPackedType)
+      return failure();
+    auto packedCast = packedSource.getDefiningOp<vector::ShapeCastOp>();
+    auto rhsRead =
+        packedCast
+            ? packedCast.getSource().getDefiningOp<vector::TransferReadOp>()
+            : packedSource.getDefiningOp<vector::TransferReadOp>();
+    if (!lhs || !isSimpleReadOutsideLoop(rhsRead, loop))
+      return failure();
+    std::optional<ExpandedRead> splitRhs;
+    if (packedCast) {
+      auto flatType = rhsRead.getVectorType();
+      if (flatType.getRank() != 2 ||
+          flatType.getDimSize(0) != rhsPackedType.getDimSize(0) ||
+          flatType.getDimSize(1) % factor != 0 ||
+          flatType.getDimSize(1) / factor != rhsPackedType.getDimSize(1) ||
+          !(splitRhs = getExpandableRead(rhsRead, factor, loop)))
+        return failure();
+    } else if (rhsRead.getVectorType() != rhsPackedType ||
+               getConstantIntValue(rhsRead.getIndices().back()) != 0) {
+      return failure();
+    }
+
+    Location loc = contract.getLoc();
+    VectorType lhsPackedType =
+        VectorType::get({lhsType.getDimSize(0), lhsType.getDimSize(1) / factor,
+                         int64_t(factor)},
+                        element);
+    Value packedLhs = buildExpandedRead(rewriter, loc, *lhs, lhsPackedType);
+    Value packedRhs =
+        splitRhs ? buildExpandedRead(rewriter, loc, *splitRhs, rhsPackedType)
+                 : rhsRead.getResult();
+    rewriter.setInsertionPoint(contract);
+    auto ctx = rewriter.getContext();
+    auto m = rewriter.getAffineDimExpr(0);
+    auto n = rewriter.getAffineDimExpr(1);
+    auto k = rewriter.getAffineDimExpr(2);
+    auto v = rewriter.getAffineDimExpr(3);
+    auto vnniMaps =
+        rewriter.getAffineMapArrayAttr({AffineMap::get(4, 0, {m, k, v}, ctx),
+                                        AffineMap::get(4, 0, {k, n, v}, ctx),
+                                        AffineMap::get(4, 0, {m, n}, ctx)});
+    auto iterators = rewriter.getArrayAttr(
+        {vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
+         vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
+         vector::IteratorTypeAttr::get(ctx, vector::IteratorType::reduction),
+         vector::IteratorTypeAttr::get(ctx, vector::IteratorType::reduction)});
+    rewriter.replaceOpWithNewOp<vector::ContractionOp>(
+        contract, packedLhs, packedRhs, contract.getAcc(), vnniMaps, iterators,
+        contract.getKind(), contract.getFastmath());
     return success();
   }
 };
@@ -286,5 +478,6 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
 
 void x86::populatePrepareVectorContractLoopsPatterns(
     RewritePatternSet &patterns) {
-  patterns.add<NormalizeCounter, RebaseReadIndices>(patterns.getContext());
+  patterns.add<NormalizeCounter, RebaseReadIndices, FoldVNNIUnpacking>(
+      patterns.getContext());
 }

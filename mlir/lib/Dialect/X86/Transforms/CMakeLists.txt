@@ -12,8 +12,8 @@ add_mlir_dialect_library(MLIRX86Transforms
   PrepareVectorContractLoops.cpp
 
   LINK_LIBS PUBLIC
+  MLIRAffineDialect
   MLIRArithDialect
-  MLIRArithTransforms
   MLIRDataLayoutInterfaces
   MLIRDialectUtils
   MLIRIR
@@ -23,8 +23,8 @@ add_mlir_dialect_library(MLIRX86Transforms
   MLIRLLVMDialect
   MLIRSCFDialect
   MLIRSCFUtils
-  MLIRVectorDialect
   MLIRValueBoundsOpInterface
+  MLIRVectorDialect
   MLIRVectorUtils
   MLIRX86Dialect
   MLIRX86Utils
