@@ -16,6 +16,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/X86/Transforms.h"
 #include "mlir/Dialect/X86/Utils/X86Utils.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
@@ -71,6 +72,18 @@ static bool fitsInSignedWidth(Value value, unsigned width) {
          cast.getIn().getType().getIntOrFloatBitWidth() <= width;
 }
 
+/// Returns true if every value that `value` takes is a multiple of `divisor`.
+static bool isMultipleOf(Value value, const APInt &divisor) {
+  APInt constant;
+  if (matchPattern(value, m_ConstantInt(&constant)))
+    return constant.srem(divisor).isZero();
+  // Signed scf.for IVs take the values lb + j * step without overflow.
+  auto loop = scf::getForInductionVarOwner(value);
+  return loop && loop.getInductionVar() == value && !loop.getUnsignedCmp() &&
+         isMultipleOf(loop.getLowerBound(), divisor) &&
+         isMultipleOf(loop.getStep(), divisor);
+}
+
 struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -80,6 +93,29 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
       return failure();
 
     Value iv = loop.getInductionVar();
+    // (iv / c) * c is iv when every IV value is a multiple of c.
+    SmallVector<Operation *> roundings;
+    for (Operation *div : iv.getUsers()) {
+      APInt divisor;
+      if (!isa<arith::DivSIOp, arith::CeilDivSIOp, arith::FloorDivSIOp>(div) ||
+          div->getOperand(0) != iv ||
+          !matchPattern(div->getOperand(1), m_ConstantInt(&divisor)) ||
+          !divisor.isStrictlyPositive() || !isMultipleOf(iv, divisor))
+        continue;
+      for (Operation *mul : div->getUsers()) {
+        APInt factor;
+        if (isa<arith::MulIOp>(mul) &&
+            (matchPattern(mul->getOperand(0), m_ConstantInt(&factor)) ||
+             matchPattern(mul->getOperand(1), m_ConstantInt(&factor))) &&
+            factor == divisor)
+          roundings.push_back(mul);
+      }
+    }
+    for (Operation *mul : roundings)
+      rewriter.replaceOp(mul, iv);
+    if (!roundings.empty())
+      return success();
+
     if (auto intType = dyn_cast<IntegerType>(iv.getType())) {
       unsigned indexWidth =
           DataLayout::closest(loop).getTypeSizeInBits(rewriter.getIndexType());
