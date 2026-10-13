@@ -13,10 +13,13 @@ add_mlir_dialect_library(MLIRX86Transforms
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRDataLayoutInterfaces
+  MLIRDialectUtils
   MLIRIR
   MLIRLinalgDialect
   MLIRLLVMCommonConversion
   MLIRLLVMDialect
+  MLIRSCFDialect
   MLIRVectorDialect
   MLIRVectorUtils
   MLIRX86Dialect
