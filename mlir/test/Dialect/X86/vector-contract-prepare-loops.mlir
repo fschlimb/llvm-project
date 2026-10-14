@@ -327,6 +327,35 @@ func.func @round_down_k(%a: memref<?x?xbf16>, %b: memref<?x?xbf16>,
   return %result : vector<16x32xf32>
 }
 
+// fold round-down and cast of an integer IV to a direct index IV
+// CHECK-LABEL: func.func @round_down_integer_counter(
+// CHECK-SAME: %[[A:[^,]+]]: memref<?x?xbf16>, %[[B:[^,]+]]: memref<?x?xbf16>
+// NANO-LABEL: func.func @round_down_integer_counter(
+// NANO-NOT: vector.contract
+// NANO: return
+// CHECK: scf.for %[[K:.+]] = %{{.+}} to %{{.+}} step %{{.+}}
+// CHECK-NOT: arith.muli
+// CHECK-NOT: arith.index_cast
+// CHECK: vector.transfer_read %[[A]][%{{.+}}, %[[K]]]
+// CHECK: vector.transfer_read %[[B]][%[[K]], %{{.+}}]
+func.func @round_down_integer_counter(%a: memref<?x?xbf16>, %b: memref<?x?xbf16>,
+                                      %init: vector<16x32xf32>, %ub: i32,
+                                      %m: index, %n: index) -> vector<16x32xf32> {
+  %lb = arith.constant 0 : i32
+  %step = arith.constant 32 : i32
+  %pad = arith.constant 0.0 : bf16
+  %result = scf.for %k = %lb to %ub step %step iter_args(%accum = %init) -> (vector<16x32xf32>) : i32 {
+    %div = arith.divsi %k, %step : i32
+    %rounded = arith.muli %div, %step : i32
+    %idx = arith.index_cast %rounded : i32 to index
+    %lhs = vector.transfer_read %a[%m, %idx], %pad {in_bounds = [true, true]} : memref<?x?xbf16>, vector<16x32xbf16>
+    %rhs = vector.transfer_read %b[%idx, %n], %pad {in_bounds = [true, true]} : memref<?x?xbf16>, vector<32x32xbf16>
+    %dot = vector.contract {indexing_maps = [#lhs, #rhs, #acc], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %lhs, %rhs, %accum : vector<16x32xbf16>, vector<32x32xbf16> into vector<16x32xf32>
+    scf.yield %dot : vector<16x32xf32>
+  }
+  return %result : vector<16x32xf32>
+}
+
 // fold exact round-down (k ceildiv 16) * 16 to k with a tiled lower bound
 // CHECK-LABEL: func.func @round_down_tiled_k(
 // CHECK: scf.for %[[KK:.+]] = %{{.+}} to %{{.+}} step %{{.+}}

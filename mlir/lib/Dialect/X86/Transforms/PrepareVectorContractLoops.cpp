@@ -12,7 +12,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/X86/Transforms.h"
 #include "mlir/Dialect/X86/Utils/X86Utils.h"
@@ -20,23 +19,34 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "x86-prepare-vector-contract-loops"
 
 using namespace mlir;
 
 namespace {
-static vector::ContractionOp getCandidate(scf::ForOp loop) {
-  if (loop.getNumRegionIterArgs() != 1)
+vector::ContractionOp getCandidate(scf::ForOp loop) {
+  if (loop.getNumRegionIterArgs() != 1) {
+    LLVM_DEBUG(llvm::dbgs() << "reject loop at " << loop.getLoc()
+                            << ": expected one iter_arg\n");
     return {};
+  }
 
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   for (Operation &op : loop.getBody()->without_terminator()) {
     auto contract = dyn_cast<vector::ContractionOp>(&op);
-    if (!contract || contract.getKind() != vector::CombiningKind::ADD ||
+    if (!contract)
+      continue;
+    if (contract.getKind() != vector::CombiningKind::ADD ||
         contract.getAcc() != loop.getRegionIterArgs().front() ||
         !contract.getAcc().hasOneUse() || !contract.getResult().hasOneUse() ||
         yield->getNumOperands() != 1 ||
-        yield->getOperand(0) != contract.getResult())
+        yield->getOperand(0) != contract.getResult()) {
+      LLVM_DEBUG(llvm::dbgs() << "reject contraction at " << contract.getLoc()
+                              << ": not a single loop-carried accumulation\n");
       continue;
+    }
 
     auto iterators = contract.getIteratorTypesArray();
     auto maps = contract.getIndexingMapsArray();
@@ -46,11 +56,10 @@ static vector::ContractionOp getCandidate(scf::ForOp loop) {
     auto k = getAffineDimExpr(2, ctx);
     auto par = vector::IteratorType::parallel;
     auto red = vector::IteratorType::reduction;
-    if ((isRowMajorMatmul(contract.getIndexingMaps()) &&
-         llvm::equal(iterators, ArrayRef{par, par, red}) &&
-         maps[0] == AffineMap::get(3, 0, {m, k}, ctx) &&
-         maps[1] == AffineMap::get(3, 0, {k, n}, ctx) &&
-         maps[2] == AffineMap::get(3, 0, {m, n}, ctx)))
+    if (llvm::equal(iterators, ArrayRef{par, par, red}) &&
+        maps[0] == AffineMap::get(3, 0, {m, k}, ctx) &&
+        maps[1] == AffineMap::get(3, 0, {k, n}, ctx) &&
+        maps[2] == AffineMap::get(3, 0, {m, n}, ctx))
       return contract;
 
     auto v = getAffineDimExpr(3, ctx);
@@ -60,11 +69,13 @@ static vector::ContractionOp getCandidate(scf::ForOp loop) {
         maps[1] == AffineMap::get(4, 0, {k, n, v}, ctx) &&
         maps[2] == AffineMap::get(4, 0, {m, n}, ctx))
       return contract;
+    LLVM_DEBUG(llvm::dbgs() << "reject contraction at " << contract.getLoc()
+                            << ": noncanonical matmul layout or iterators\n");
   }
   return {};
 }
 
-static bool fitsInSignedWidth(Value value, unsigned width) {
+bool fitsInSignedWidth(Value value, unsigned width) {
   if (auto constant = getConstantIntValue(value))
     return llvm::isIntN(width, *constant);
   auto cast = value.getDefiningOp<arith::IndexCastOp>();
@@ -73,7 +84,7 @@ static bool fitsInSignedWidth(Value value, unsigned width) {
 }
 
 /// Returns true if every value that `value` takes is a multiple of `divisor`.
-static bool isMultipleOf(Value value, const APInt &divisor) {
+bool isMultipleOf(Value value, const APInt &divisor) {
   APInt constant;
   if (matchPattern(value, m_ConstantInt(&constant)))
     return constant.srem(divisor).isZero();
@@ -84,13 +95,17 @@ static bool isMultipleOf(Value value, const APInt &divisor) {
          isMultipleOf(loop.getStep(), divisor);
 }
 
-struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
+// Expose the IV as a direct read index by folding exact round-downs and
+// normalizing safe integer/index conversions.
+struct CanonicalizeLoopIV : OpRewritePattern<scf::ForOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ForOp loop,
                                 PatternRewriter &rewriter) const override {
-    if (loop.getUnsignedCmp() || !getCandidate(loop))
-      return failure();
+    if (loop.getUnsignedCmp())
+      return rewriter.notifyMatchFailure(loop, "unsigned loop");
+    if (!getCandidate(loop))
+      return rewriter.notifyMatchFailure(loop, "no canonical contraction");
 
     Value iv = loop.getInductionVar();
     // (iv / c) * c is iv when every IV value is a multiple of c.
@@ -120,7 +135,7 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
       unsigned indexWidth =
           DataLayout::closest(loop).getTypeSizeInBits(rewriter.getIndexType());
       if (intType.getWidth() > indexWidth)
-        return failure();
+        return rewriter.notifyMatchFailure(loop, "integer IV wider than index");
 
       SmallVector<arith::IndexCastOp> indexUsers;
       for (Operation *user : iv.getUsers())
@@ -128,7 +143,8 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
             cast && cast.getType().isIndex())
           indexUsers.push_back(cast);
       if (indexUsers.empty())
-        return failure();
+        return rewriter.notifyMatchFailure(
+            loop, "integer IV has no index cast users");
 
       // scf.for makes overflowing induction-variable values undefined.
       rewriter.setInsertionPoint(loop);
@@ -155,14 +171,21 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
       return success();
     }
 
+    bool hasIntegerCast = false, hasSafeIntegerCast = false;
     for (Operation *user : iv.getUsers()) {
       auto inner = dyn_cast<arith::IndexCastOp>(user);
       if (!inner || !isa<IntegerType>(inner.getType()))
         continue;
+      hasIntegerCast = true;
       unsigned width = cast<IntegerType>(inner.getType()).getWidth();
       if (!fitsInSignedWidth(loop.getLowerBound(), width) ||
-          !fitsInSignedWidth(loop.getUpperBound(), width))
+          !fitsInSignedWidth(loop.getUpperBound(), width)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "skip index cast round trip at " << loop.getLoc()
+                   << ": bounds do not fit i" << width << '\n');
         continue;
+      }
+      hasSafeIntegerCast = true;
       // All signed IV values lie between the two bounds.
       for (Operation *castUser : inner.getResult().getUsers()) {
         auto outer = dyn_cast<arith::IndexCastOp>(castUser);
@@ -172,7 +195,13 @@ struct NormalizeCounter : OpRewritePattern<scf::ForOp> {
         }
       }
     }
-    return failure();
+    if (!hasIntegerCast)
+      return rewriter.notifyMatchFailure(loop, "IV has no cast to integer");
+    if (!hasSafeIntegerCast)
+      return rewriter.notifyMatchFailure(loop,
+                                         "loop bounds do not fit cast width");
+    return rewriter.notifyMatchFailure(
+        loop, "no cast back to index from a safe cast");
   }
 };
 
@@ -183,8 +212,7 @@ struct ReadOffset {
   ValueDimList operands;
 };
 
-static bool isSimpleReadOutsideLoop(vector::TransferReadOp read,
-                                    scf::ForOp loop) {
+bool isSimpleReadOutsideLoop(vector::TransferReadOp read, scf::ForOp loop) {
   return read && read->getParentOp() == loop &&
          isa<MemRefType>(read.getBase().getType()) &&
          loop.isDefinedOutsideOfLoop(read.getBase()) &&
@@ -192,7 +220,7 @@ static bool isSimpleReadOutsideLoop(vector::TransferReadOp read,
          !read.hasOutOfBoundsDim();
 }
 
-static bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
+bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
   Value lb = loop.getLowerBound(), ub = loop.getUpperBound();
   auto lower = getConstantIntValue(lb);
   auto upper = getConstantIntValue(ub);
@@ -206,7 +234,7 @@ static bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
 /// Returns true if `value` combines the IV and loop invariants using only
 /// addi, subi and muli. Unlike divisions, these stay congruent modulo 2^n to
 /// the overflow-free arithmetic that value bounds reason about.
-static bool isRingExpression(Value value, scf::ForOp loop) {
+bool isRingExpression(Value value, scf::ForOp loop) {
   SmallVector<Value> worklist{value};
   DenseSet<Value> visited;
   while (!worklist.empty()) {
@@ -222,38 +250,52 @@ static bool isRingExpression(Value value, scf::ForOp loop) {
   return true;
 }
 
+// Rebase contraction reads onto the loop IV:
+//   - Prove each read index differs from the IV by a loop-invariant offset.
+//   - Move that offset into a subview; shift a nonzero loop lower bound to
+//   zero.
+// For LB = 0, A[m, k + off] becomes a read at [m, k] from a subview at [0,
+// off].
 struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ForOp loop,
                                 PatternRewriter &rewriter) const override {
     auto contract = getCandidate(loop);
-    if (!contract || loop.getUnsignedCmp() ||
-        !loop.getInductionVar().getType().isIndex())
-      return failure();
+    if (!contract)
+      return rewriter.notifyMatchFailure(loop, "no canonical contraction");
+    if (loop.getUnsignedCmp())
+      return rewriter.notifyMatchFailure(loop, "unsigned loop");
+    if (!loop.getInductionVar().getType().isIndex())
+      return rewriter.notifyMatchFailure(loop, "IV is not index-typed");
 
     SmallVector<ReadOffset> offsets;
     bool needsRebasing = false;
     for (Value operand : {contract.getLhs(), contract.getRhs()}) {
       auto read = operand.getDefiningOp<vector::TransferReadOp>();
       if (!isSimpleReadOutsideLoop(read, loop))
-        return failure();
+        return rewriter.notifyMatchFailure(
+            loop, "operand is not a simple read from an invariant memref");
 
       std::optional<unsigned> position;
       for (auto [i, index] : llvm::enumerate(read.getIndices())) {
         if (!loop.isDefinedOutsideOfLoop(index)) {
           if (position)
-            return failure();
+            return rewriter.notifyMatchFailure(
+                loop, "read has multiple loop-dependent indices");
           position = i;
         }
       }
       if (!position)
-        return failure();
+        return rewriter.notifyMatchFailure(loop,
+                                           "read has no loop-dependent index");
 
       Value index = read.getIndices()[*position];
       if (!isRingExpression(index, loop))
-        return failure();
+        return rewriter.notifyMatchFailure(
+            loop, "read index is not an IV-based add/sub/mul expression");
       needsRebasing |= index != loop.getInductionVar();
+      // Represent index - IV so ValueBounds can prove a loop-invariant offset.
       MLIRContext *ctx = rewriter.getContext();
       auto map = AffineMap::get(
           0, 2, getAffineSymbolExpr(0, ctx) - getAffineSymbolExpr(1, ctx));
@@ -267,24 +309,28 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
       };
       if (failed(ValueBoundsConstraintSet::computeBound(
               bound, boundOperands, presburger::BoundType::EQ, delta, outside)))
-        return failure();
-      if (bound.getNumResults() != 1 ||
-          llvm::any_of(boundOperands, [&](auto valueDim) {
+        return rewriter.notifyMatchFailure(
+            loop, "cannot prove an IV-independent read offset");
+      if (bound.getNumResults() != 1)
+        return rewriter.notifyMatchFailure(loop, "read offset is not singular");
+      if (llvm::any_of(boundOperands, [&](auto valueDim) {
             return valueDim.second ||
                    !loop.isDefinedOutsideOfLoop(valueDim.first);
           }))
-        return failure();
+        return rewriter.notifyMatchFailure(
+            loop, "read offset depends on a loop value or dimension");
       offsets.push_back({read, *position, bound, std::move(boundOperands)});
     }
     if (!needsRebasing)
-      return failure();
+      return rewriter.notifyMatchFailure(loop, "reads already use the IV");
 
     Value lb = loop.getLowerBound();
     bool shift = getConstantIntValue(lb) != 0;
     if (shift &&
         !canShiftLowerBound(loop, DataLayout::closest(loop).getTypeSizeInBits(
                                       rewriter.getIndexType())))
-      return failure();
+      return rewriter.notifyMatchFailure(
+          loop, "cannot safely shift the loop lower bound");
     for (ReadOffset &offset : offsets) {
       if (!shift &&
           offset.read.getIndices()[offset.position] == loop.getInductionVar())
@@ -293,13 +339,14 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
       int64_t baseOffset;
       if (failed(cast<MemRefType>(offset.read.getBase().getType())
                      .getStridesAndOffset(strides, baseOffset)))
-        return failure();
+        return rewriter.notifyMatchFailure(loop, "read base is not strided");
     }
 
     rewriter.setInsertionPoint(loop);
     Location loc = loop.getLoc();
     SmallVector<Value> subviews;
     for (ReadOffset &offset : offsets) {
+      // A read already using the unshifted IV needs no subview.
       if (!shift &&
           offset.read.getIndices()[offset.position] == loop.getInductionVar()) {
         subviews.push_back({});
@@ -311,6 +358,7 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
       SmallVector<OpFoldResult> mapOperands;
       for (auto valueDim : offset.operands)
         mapOperands.push_back(valueDim.first);
+      // Materialize the proved offset before the loop.
       Value delta = getValueOrCreateConstantIndexOp(
           rewriter, loc,
           affine::makeComposedFoldedAffineApply(rewriter, loc, offset.map,
@@ -323,6 +371,7 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
       Value clamped = arith::MinSIOp::create(
           rewriter, loc, arith::MaxSIOp::create(rewriter, loc, first, zero),
           dim);
+      // Slice the dependent dimension's tail; keep other dimensions whole.
       for (unsigned i = 0; i < type.getRank(); ++i) {
         strides.push_back(rewriter.getIndexAttr(1));
         if (i == offset.position) {
@@ -356,6 +405,7 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
                                    rewriter.getIndexAttr(1));
     }
 
+    // modify affected reads
     for (unsigned i = 0; i < offsets.size(); ++i) {
       if (!subviews[i])
         continue;
@@ -370,6 +420,7 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
     return success();
   }
 };
+
 struct ExpandedRead {
   vector::TransferReadOp read;
   MemRefType type;
@@ -377,13 +428,13 @@ struct ExpandedRead {
   int64_t lastIndex;
 };
 
-static std::optional<ExpandedRead>
-getExpandableRead(vector::TransferReadOp read, unsigned factor,
-                  scf::ForOp loop) {
+std::optional<ExpandedRead> getExpandableRead(vector::TransferReadOp read,
+                                              unsigned factor,
+                                              scf::ForOp loop) {
   if (!isSimpleReadOutsideLoop(read, loop))
     return std::nullopt;
-  auto type = dyn_cast<MemRefType>(read.getBase().getType());
-  if (!type || type.getElementType() != read.getVectorType().getElementType() ||
+  auto type = cast<MemRefType>(read.getBase().getType());
+  if (type.getElementType() != read.getVectorType().getElementType() ||
       type.getRank() < 2 || type.isDynamicDim(type.getRank() - 1) ||
       type.getShape().back() % factor != 0)
     return std::nullopt;
@@ -406,8 +457,8 @@ getExpandableRead(vector::TransferReadOp read, unsigned factor,
   return ExpandedRead{read, *expanded, reassociation, *lastIndex / factor};
 }
 
-static Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
-                               ExpandedRead &info, VectorType resultType) {
+Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
+                        ExpandedRead &info, VectorType resultType) {
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(info.read->getParentOp());
   Value expanded = memref::ExpandShapeOp::create(
@@ -426,54 +477,77 @@ static Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
   return packed;
 }
 
+// Fold RHS unpacking into a VNNI contraction:
+//   - Match a packed RHS read transposed and flattened for a flat matmul.
+//   - Split the LHS memref's K dimension and reread it in packed lanes.
+//   - Contract the packed reads directly over K and the VNNI lane dimension.
+// For bf16, 32x32 LHS and RHS become 32x16x2 LHS and 16x32x2 RHS.
 struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(vector::ContractionOp contract,
                                 PatternRewriter &rewriter) const override {
     auto loop = dyn_cast<scf::ForOp>(contract->getParentOp());
-    if (!loop || getCandidate(loop) != contract)
-      return failure();
+    if (!loop)
+      return rewriter.notifyMatchFailure(contract,
+                                         "not directly in a for loop");
+    if (getCandidate(loop) != contract)
+      return rewriter.notifyMatchFailure(
+          contract, "not the loop's canonical contraction");
 
     auto lhsType = contract.getLhsType();
     auto rhsType = contract.getRhsType();
     auto accType = dyn_cast<VectorType>(contract.getAccType());
     Type element = lhsType.getElementType();
-    if (!accType || lhsType.isScalable() || rhsType.isScalable() ||
-        lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
-        accType.getRank() != 2 || element != rhsType.getElementType() ||
-        !(element.isBF16() || element.isInteger(8)))
-      return failure();
+    if (!accType || lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
+        accType.getRank() != 2)
+      return rewriter.notifyMatchFailure(
+          contract, "expected 2D operands and accumulator");
+    if (lhsType.isScalable() || rhsType.isScalable())
+      return rewriter.notifyMatchFailure(contract, "scalable operand vectors");
+    if (element != rhsType.getElementType())
+      return rewriter.notifyMatchFailure(contract,
+                                         "operand element types differ");
+    if (!(element.isBF16() || element.isInteger(8)))
+      return rewriter.notifyMatchFailure(contract,
+                                         "expected bf16 or i8 operands");
     unsigned factor = 32 / element.getIntOrFloatBitWidth();
-    if (lhsType.getDimSize(1) != rhsType.getDimSize(0) ||
-        lhsType.getDimSize(1) % factor != 0)
-      return failure();
+    if (lhsType.getDimSize(1) != rhsType.getDimSize(0))
+      return rewriter.notifyMatchFailure(contract, "K dimensions differ");
+    if (lhsType.getDimSize(1) % factor != 0)
+      return rewriter.notifyMatchFailure(
+          contract, "K dimension is not divisible by VNNI factor");
 
     auto shapeCast = contract.getRhs().getDefiningOp<vector::ShapeCastOp>();
     auto transpose =
         shapeCast ? shapeCast.getSource().getDefiningOp<vector::TransposeOp>()
                   : vector::TransposeOp();
     if (!transpose || transpose->getParentOp() != loop)
-      return failure();
+      return rewriter.notifyMatchFailure(
+          contract, "RHS is not an in-loop transpose followed by shape_cast");
     VectorType rhsPackedType =
         VectorType::get({lhsType.getDimSize(1) / factor, rhsType.getDimSize(1),
                          int64_t(factor)},
                         element);
     auto sourceType = cast<VectorType>(transpose.getVector().getType());
     if (sourceType.getRank() < rhsPackedType.getRank())
-      return failure();
+      return rewriter.notifyMatchFailure(contract,
+                                         "RHS source rank is too small");
     unsigned leading = sourceType.getRank() - rhsPackedType.getRank();
     if (!llvm::all_of(sourceType.getShape().take_front(leading),
                       [](int64_t dim) { return dim == 1; }) ||
         !llvm::equal(sourceType.getShape().drop_front(leading),
                      rhsPackedType.getShape()))
-      return failure();
+      return rewriter.notifyMatchFailure(contract,
+                                         "RHS source is not VNNI packed");
     for (unsigned i = 0; i < leading + 1; ++i)
       if (transpose.getPermutation()[i] != i)
-        return failure();
+        return rewriter.notifyMatchFailure(
+            contract, "transpose reorders leading or K dimensions");
     if (transpose.getPermutation()[leading + 1] != leading + 2 ||
         transpose.getPermutation()[leading + 2] != leading + 1)
-      return failure();
+      return rewriter.notifyMatchFailure(
+          contract, "transpose does not swap N and VNNI lanes");
 
     auto lhsRead = contract.getLhs().getDefiningOp<vector::TransferReadOp>();
     auto lhs = getExpandableRead(lhsRead, factor, loop);
@@ -481,26 +555,38 @@ struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
     Value packedSource =
         broadcast ? broadcast.getSource() : transpose.getVector();
     if (broadcast && packedSource.getType() != rhsPackedType)
-      return failure();
+      return rewriter.notifyMatchFailure(contract,
+                                         "broadcast source is not VNNI packed");
     auto packedCast = packedSource.getDefiningOp<vector::ShapeCastOp>();
     auto rhsRead =
         packedCast
             ? packedCast.getSource().getDefiningOp<vector::TransferReadOp>()
             : packedSource.getDefiningOp<vector::TransferReadOp>();
-    if (!lhs || !isSimpleReadOutsideLoop(rhsRead, loop))
-      return failure();
+    if (!lhs)
+      return rewriter.notifyMatchFailure(
+          contract, "LHS read cannot be expanded into VNNI layout");
+    if (!isSimpleReadOutsideLoop(rhsRead, loop))
+      return rewriter.notifyMatchFailure(contract,
+                                         "RHS is not a simple transfer read");
     std::optional<ExpandedRead> splitRhs;
     if (packedCast) {
       auto flatType = rhsRead.getVectorType();
       if (flatType.getRank() != 2 ||
           flatType.getDimSize(0) != rhsPackedType.getDimSize(0) ||
           flatType.getDimSize(1) % factor != 0 ||
-          flatType.getDimSize(1) / factor != rhsPackedType.getDimSize(1) ||
-          !(splitRhs = getExpandableRead(rhsRead, factor, loop)))
-        return failure();
-    } else if (rhsRead.getVectorType() != rhsPackedType ||
-               getConstantIntValue(rhsRead.getIndices().back()) != 0) {
-      return failure();
+          flatType.getDimSize(1) / factor != rhsPackedType.getDimSize(1))
+        return rewriter.notifyMatchFailure(
+            contract, "flat RHS shape is not VNNI compatible");
+      if (!(splitRhs = getExpandableRead(rhsRead, factor, loop)))
+        return rewriter.notifyMatchFailure(
+            contract, "RHS read cannot be expanded into VNNI layout");
+    } else {
+      if (rhsRead.getVectorType() != rhsPackedType)
+        return rewriter.notifyMatchFailure(contract,
+                                           "RHS read is not VNNI packed");
+      if (getConstantIntValue(rhsRead.getIndices().back()) != 0)
+        return rewriter.notifyMatchFailure(
+            contract, "packed RHS has nonzero inner offset");
     }
 
     Location loc = contract.getLoc();
@@ -537,6 +623,6 @@ struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
 
 void x86::populatePrepareVectorContractLoopsPatterns(
     RewritePatternSet &patterns) {
-  patterns.add<NormalizeCounter, RebaseReadIndices, FoldVNNIUnpacking>(
+  patterns.add<CanonicalizeLoopIV, RebaseReadIndices, FoldVNNIUnpacking>(
       patterns.getContext());
 }
