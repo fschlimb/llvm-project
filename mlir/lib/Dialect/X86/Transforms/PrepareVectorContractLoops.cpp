@@ -203,6 +203,25 @@ static bool canShiftLowerBound(scf::ForOp loop, unsigned indexWidth) {
          fitsInSignedWidth(ub, 32);
 }
 
+/// Returns true if `value` combines the IV and loop invariants using only
+/// addi, subi and muli. Unlike divisions, these stay congruent modulo 2^n to
+/// the overflow-free arithmetic that value bounds reason about.
+static bool isRingExpression(Value value, scf::ForOp loop) {
+  SmallVector<Value> worklist{value};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value next = worklist.pop_back_val();
+    if (!visited.insert(next).second || next == loop.getInductionVar() ||
+        loop.isDefinedOutsideOfLoop(next) || matchPattern(next, m_Constant()))
+      continue;
+    Operation *op = next.getDefiningOp();
+    if (!isa_and_present<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op))
+      return false;
+    llvm::append_range(worklist, op->getOperands());
+  }
+  return true;
+}
+
 struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -232,6 +251,8 @@ struct RebaseReadIndices : OpRewritePattern<scf::ForOp> {
         return failure();
 
       Value index = read.getIndices()[*position];
+      if (!isRingExpression(index, loop))
+        return failure();
       needsRebasing |= index != loop.getInductionVar();
       MLIRContext *ctx = rewriter.getContext();
       auto map = AffineMap::get(
@@ -362,7 +383,8 @@ getExpandableRead(vector::TransferReadOp read, unsigned factor,
   if (!isSimpleReadOutsideLoop(read, loop))
     return std::nullopt;
   auto type = dyn_cast<MemRefType>(read.getBase().getType());
-  if (!type || type.getRank() < 2 || type.isDynamicDim(type.getRank() - 1) ||
+  if (!type || type.getElementType() != read.getVectorType().getElementType() ||
+      type.getRank() < 2 || type.isDynamicDim(type.getRank() - 1) ||
       type.getShape().back() % factor != 0)
     return std::nullopt;
   auto lastIndex = getConstantIntValue(read.getIndices().back());
@@ -417,7 +439,8 @@ struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
     auto rhsType = contract.getRhsType();
     auto accType = dyn_cast<VectorType>(contract.getAccType());
     Type element = lhsType.getElementType();
-    if (!accType || lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
+    if (!accType || lhsType.isScalable() || rhsType.isScalable() ||
+        lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
         accType.getRank() != 2 || element != rhsType.getElementType() ||
         !(element.isBF16() || element.isInteger(8)))
       return failure();

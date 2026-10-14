@@ -383,6 +383,35 @@ func.func @non_affine_k(%a: memref<?x?xbf16>, %b: memref<?x?xbf16>,
   return %result : vector<16x32xf32>
 }
 
+// negative test: floordivsi of possibly wrapping k * 2 is not k -> skip
+// CHECK-LABEL: func.func @wrapping_index(
+// CHECK-SAME: %[[A:[^,]+]]: memref<?x?xbf16>, %[[B:[^,]+]]: memref<?x?xbf16>
+// CHECK-NOT: memref.subview
+// CHECK: scf.for %[[K:.+]] = %{{.+}} to %{{.+}} step %{{.+}}
+// CHECK: %[[TWICE:.+]] = arith.muli %[[K]], %{{.+}} : index
+// CHECK: %[[HALF:.+]] = arith.floordivsi %[[TWICE]], %{{.+}} : index
+// CHECK: %[[IDX:.+]] = arith.addi %[[HALF]], %{{.+}} : index
+// CHECK: vector.transfer_read %[[A]][%{{.+}}, %[[IDX]]]
+// CHECK: vector.transfer_read %[[B]][%[[IDX]], %{{.+}}]
+func.func @wrapping_index(%a: memref<?x?xbf16>, %b: memref<?x?xbf16>,
+                          %init: vector<16x32xf32>, %ub: index,
+                          %m: index, %n: index, %off: index) -> vector<16x32xf32> {
+  %lb = arith.constant 0 : index
+  %step = arith.constant 32 : index
+  %c2 = arith.constant 2 : index
+  %pad = arith.constant 0.0 : bf16
+  %result = scf.for %k = %lb to %ub step %step iter_args(%accum = %init) -> (vector<16x32xf32>) {
+    %twice = arith.muli %k, %c2 : index
+    %half = arith.floordivsi %twice, %c2 : index
+    %idx = arith.addi %half, %off : index
+    %lhs = vector.transfer_read %a[%m, %idx], %pad {in_bounds = [true, true]} : memref<?x?xbf16>, vector<16x32xbf16>
+    %rhs = vector.transfer_read %b[%idx, %n], %pad {in_bounds = [true, true]} : memref<?x?xbf16>, vector<32x32xbf16>
+    %dot = vector.contract {indexing_maps = [#lhs, #rhs, #acc], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %lhs, %rhs, %accum : vector<16x32xbf16>, vector<32x32xbf16> into vector<16x32xf32>
+    scf.yield %dot : vector<16x32xf32>
+  }
+  return %result : vector<16x32xf32>
+}
+
 // negative test: lhs read has two IV-dependent indices -> skip
 // CHECK-LABEL: func.func @two_dependent_indices(
 // CHECK-SAME: %[[A:[^,]+]]: memref<?x?xbf16>, %[[B:[^,]+]]: memref<?x?xbf16>
@@ -706,6 +735,58 @@ func.func @interleaved_lanes(%a: memref<?x32x64xi8>,
     scf.yield %dot : vector<32x32xi32>
   }
   return %result : vector<32x32xi32>
+}
+
+// negative test: scalable lhs cannot be packed into a fixed VNNI shape -> skip
+// CHECK-LABEL: func.func @scalable_vnni(
+// CHECK-SAME: %[[A:[^,]+]]: memref<?x?x32xbf16>
+// CHECK-NOT: memref.expand_shape
+// CHECK: %[[LHS:.+]] = vector.transfer_read %[[A]][{{.*}} vector<[32]x32xbf16>
+// CHECK: %[[T:.+]] = vector.transpose
+// CHECK: %[[FLAT:.+]] = vector.shape_cast %[[T]] : vector<16x2x32xbf16> to vector<32x32xbf16>
+// CHECK: vector.contract {{.*}} %[[LHS]], %[[FLAT]], %{{.+}} : vector<[32]x32xbf16>, vector<32x32xbf16> into vector<[32]x32xf32>
+func.func @scalable_vnni(%a: memref<?x?x32xbf16>,
+                         %b: memref<?x16x32x2xbf16>,
+                         %init: vector<[32]x32xf32>, %ub: index,
+                         %m: index) -> vector<[32]x32xf32> {
+  %zero = arith.constant 0 : index
+  %step = arith.constant 16 : index
+  %pad = arith.constant 0.0 : bf16
+  %result = scf.for %k = %zero to %ub step %step iter_args(%accum = %init) -> (vector<[32]x32xf32>) {
+    %lhs = vector.transfer_read %a[%k, %m, %zero], %pad {in_bounds = [true, true]} : memref<?x?x32xbf16>, vector<[32]x32xbf16>
+    %rhs = vector.transfer_read %b[%k, %zero, %zero, %zero], %pad {in_bounds = [true, true, true]} : memref<?x16x32x2xbf16>, vector<16x32x2xbf16>
+    %transpose = vector.transpose %rhs, [0, 2, 1] : vector<16x32x2xbf16> to vector<16x2x32xbf16>
+    %flat = vector.shape_cast %transpose : vector<16x2x32xbf16> to vector<32x32xbf16>
+    %dot = vector.contract {indexing_maps = [#lhs, #rhs, #acc], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %lhs, %flat, %accum : vector<[32]x32xbf16>, vector<32x32xbf16> into vector<[32]x32xf32>
+    scf.yield %dot : vector<[32]x32xf32>
+  }
+  return %result : vector<[32]x32xf32>
+}
+
+// negative test: lhs memref with vector elements cannot be expanded into VNNI layout -> skip
+// CHECK-LABEL: func.func @vector_element_lhs(
+// CHECK-SAME: %[[A:[^,]+]]: memref<?x32xvector<32xbf16>>
+// CHECK-NOT: memref.expand_shape
+// CHECK: %[[LHS:.+]] = vector.transfer_read %[[A]][{{.*}} vector<32x32xbf16>
+// CHECK: %[[T:.+]] = vector.transpose
+// CHECK: %[[FLAT:.+]] = vector.shape_cast %[[T]] : vector<16x2x32xbf16> to vector<32x32xbf16>
+// CHECK: vector.contract {{.*}} %[[LHS]], %[[FLAT]], %{{.+}} : vector<32x32xbf16>, vector<32x32xbf16> into vector<32x32xf32>
+func.func @vector_element_lhs(%a: memref<?x32xvector<32xbf16>>,
+                              %b: memref<?x16x32x2xbf16>,
+                              %init: vector<32x32xf32>, %ub: index) -> vector<32x32xf32> {
+  %zero = arith.constant 0 : index
+  %step = arith.constant 16 : index
+  %pad = arith.constant 0.0 : bf16
+  %vpad = arith.constant dense<0.0> : vector<32xbf16>
+  %result = scf.for %k = %zero to %ub step %step iter_args(%accum = %init) -> (vector<32x32xf32>) {
+    %lhs = vector.transfer_read %a[%k, %zero], %vpad {in_bounds = [true]} : memref<?x32xvector<32xbf16>>, vector<32x32xbf16>
+    %rhs = vector.transfer_read %b[%k, %zero, %zero, %zero], %pad {in_bounds = [true, true, true]} : memref<?x16x32x2xbf16>, vector<16x32x2xbf16>
+    %transpose = vector.transpose %rhs, [0, 2, 1] : vector<16x32x2xbf16> to vector<16x2x32xbf16>
+    %flat = vector.shape_cast %transpose : vector<16x2x32xbf16> to vector<32x32xbf16>
+    %dot = vector.contract {indexing_maps = [#lhs, #rhs, #acc], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %lhs, %flat, %accum : vector<32x32xbf16>, vector<32x32xbf16> into vector<32x32xf32>
+    scf.yield %dot : vector<32x32xf32>
+  }
+  return %result : vector<32x32xf32>
 }
 
 module attributes {transform.with_named_sequence} {
