@@ -843,7 +843,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_dce to %funcs : !transform.any_op
     transform.apply_cse to %funcs : !transform.any_op
     transform.apply_patterns to %funcs {
-      transform.apply_patterns.x86.vector_contract_multi_level_unroll enable_amx
+      transform.apply_patterns.x86.vector_contract_multi_level_unroll_for_amx
       transform.apply_patterns.x86.vector_contract_to_amx_dot_product
     } : !transform.any_op
     transform.yield
