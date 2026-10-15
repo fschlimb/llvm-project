@@ -660,14 +660,17 @@ func.func @unit_dimension_reads(%a: memref<?x?x32x32xbf16>,
   return %result : vector<32x32xf32>
 }
 
-// negative test: lhs innermost dim is dynamic and might not be a multiple of VNNI factor -> skip
+// fold VNNI unpacking through a static view of a dynamic lhs innermost dim
 // CHECK-LABEL: func.func @dynamic_inner_k(
 // CHECK-SAME: %[[A:[^,]+]]: memref<?x32x?xbf16>
-// CHECK-NOT: memref.expand_shape
-// CHECK: %[[LHS:.+]] = vector.transfer_read %[[A]][{{.*}} vector<32x32xbf16>
-// CHECK: %[[T:.+]] = vector.transpose
-// CHECK: %[[FLAT:.+]] = vector.shape_cast %[[T]] : vector<16x2x32xbf16> to vector<32x32xbf16>
-// CHECK: vector.contract {{.*}} %[[LHS]], %[[FLAT]], %{{.+}} : vector<32x32xbf16>, vector<32x32xbf16> into vector<32x32xf32>
+// NANO-LABEL: func.func @dynamic_inner_k(
+// NANO-NOT: vector.contract
+// NANO: return
+// CHECK: %[[VIEW:.+]] = memref.reinterpret_cast %[[A]] {{.*}} sizes: [%{{.+}}, 32, 32]{{.*}} to memref<?x32x32xbf16, strided<[?, ?, 1]>>
+// CHECK: %[[A_PACKED:.+]] = memref.expand_shape %[[VIEW]] {{.*}} into memref<?x32x16x2xbf16, strided<[?, ?, 2, 1]>>
+// CHECK: scf.for %[[K:.+]] = %{{.+}} to %{{.+}} step %{{.+}}
+// CHECK: %[[LHS:.+]] = vector.transfer_read %[[A_PACKED]][%[[K]], {{.*}} vector<32x16x2xbf16>
+// CHECK: vector.contract {indexing_maps = [#[[$VNNI_LHS]], #[[$VNNI_RHS]], #[[$VNNI_ACC]]], iterator_types = ["parallel", "parallel", "reduction", "reduction"], kind = #vector.kind<add>} %[[LHS]], %{{.+}}, %{{.+}} : vector<32x16x2xbf16>, vector<16x32x2xbf16> into vector<32x32xf32>
 func.func @dynamic_inner_k(%a: memref<?x32x?xbf16>,
                            %b: memref<?x16x32x2xbf16>,
                            %init: vector<32x32xf32>, %ub: index,

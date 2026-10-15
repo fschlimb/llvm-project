@@ -426,6 +426,8 @@ struct ExpandedRead {
   MemRefType type;
   SmallVector<ReassociationIndices> reassociation;
   int64_t lastIndex;
+  // Static view of a dynamic last dimension, or null.
+  MemRefType view;
 };
 
 std::optional<ExpandedRead> getExpandableRead(vector::TransferReadOp read,
@@ -435,11 +437,28 @@ std::optional<ExpandedRead> getExpandableRead(vector::TransferReadOp read,
     return std::nullopt;
   auto type = cast<MemRefType>(read.getBase().getType());
   if (type.getElementType() != read.getVectorType().getElementType() ||
-      type.getRank() < 2 || type.isDynamicDim(type.getRank() - 1) ||
-      type.getShape().back() % factor != 0)
+      type.getRank() < 2)
     return std::nullopt;
   auto lastIndex = getConstantIntValue(read.getIndices().back());
-  if (!lastIndex || *lastIndex % factor != 0)
+  if (!lastIndex || *lastIndex < 0 || *lastIndex % factor != 0)
+    return std::nullopt;
+
+  MemRefType view;
+  if (type.isDynamicDim(type.getRank() - 1)) {
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (read.getVectorType().isScalable() ||
+        failed(type.getStridesAndOffset(strides, offset)))
+      return std::nullopt;
+    // The in-bounds read covers this prefix of the last dimension.
+    SmallVector<int64_t> shape(type.getShape());
+    shape.back() = *lastIndex + read.getVectorType().getShape().back();
+    view = type = MemRefType::get(
+        shape, type.getElementType(),
+        StridedLayoutAttr::get(type.getContext(), offset, strides),
+        type.getMemorySpace());
+  }
+  if (type.getShape().back() % factor != 0)
     return std::nullopt;
 
   SmallVector<int64_t> shape(type.getShape());
@@ -454,15 +473,27 @@ std::optional<ExpandedRead> getExpandableRead(vector::TransferReadOp read,
       memref::ExpandShapeOp::computeExpandedType(type, shape, reassociation);
   if (failed(expanded))
     return std::nullopt;
-  return ExpandedRead{read, *expanded, reassociation, *lastIndex / factor};
+  return ExpandedRead{read, *expanded, reassociation, *lastIndex / factor,
+                      view};
 }
 
 Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
                         ExpandedRead &info, VectorType resultType) {
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(info.read->getParentOp());
-  Value expanded = memref::ExpandShapeOp::create(
-      rewriter, loc, info.type, info.read.getBase(), info.reassociation);
+  Value base = info.read.getBase();
+  if (info.view) {
+    // Unlike subview, this view stays valid when the loop runs zero times.
+    auto metadata =
+        memref::ExtractStridedMetadataOp::create(rewriter, loc, base);
+    SmallVector<OpFoldResult> sizes = metadata.getConstifiedMixedSizes();
+    sizes.back() = rewriter.getIndexAttr(info.view.getShape().back());
+    base = memref::ReinterpretCastOp::create(
+        rewriter, loc, info.view, base, metadata.getConstifiedMixedOffset(),
+        sizes, metadata.getConstifiedMixedStrides());
+  }
+  Value expanded = memref::ExpandShapeOp::create(rewriter, loc, info.type, base,
+                                                 info.reassociation);
   Value lastIndex =
       arith::ConstantIndexOp::create(rewriter, loc, info.lastIndex);
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
@@ -480,6 +511,7 @@ Value buildExpandedRead(PatternRewriter &rewriter, Location loc,
 // Fold RHS unpacking into a VNNI contraction:
 //   - Match a packed RHS read transposed and flattened for a flat matmul.
 //   - Split the LHS memref's K dimension and reread it in packed lanes.
+//     A dynamic K dimension is first narrowed to the read's static extent.
 //   - Contract the packed reads directly over K and the VNNI lane dimension.
 // For bf16, 32x32 LHS and RHS become 32x16x2 LHS and 16x32x2 RHS.
 struct FoldVNNIUnpacking : OpRewritePattern<vector::ContractionOp> {
